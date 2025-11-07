@@ -1,0 +1,372 @@
+Path Following Document
+
+# 🎯 VL53L0X TOF Path Following Guide
+
+## 📊 How It Works (No Camera Needed!)
+
+### **Sensor Placement:**
+```
+        [FRONT]
+           🤖
+   [LEFT] 🚗 [RIGHT]
+        [BACK]
+```
+
+### **Navigation Strategy:**
+
+**1. Wall Following (Centering)**
+- Reads LEFT and RIGHT distances
+- Calculates difference: `diff = right - left`
+- Steers to equalize: If right > left → turn right to center
+
+**2. Corner Detection**
+- FRONT distance drops < 30cm → Corner ahead!
+- Slows down before hitting wall
+- Decides turn direction based on which wall is closer
+
+**3. Dead End Handling**
+- FRONT < 25cm AND both sides present → Dead end!
+- Backs up while turning toward the more open side
+- Resumes forward motion
+
+---
+
+## 🆚 Two Versions Available
+
+### **Version 1: Simple (Basic)**
+**File:** `tof_path_following.py`
+
+**How it reads sensors:**
+```python
+# Sequential reading (one after another)
+for sensor in sensors:
+    distance = sensor.range  # Blocks until reading complete (~50ms)
+    distances[name] = distance
+# Total time: ~200ms for all 4 sensors
+```
+
+**Loop rate:** ~10 Hz (100ms per loop)
+
+**Pros:**
+- ✅ Simple code, easy to understand
+- ✅ No threading complexity
+- ✅ Good for learning/testing
+
+**Cons:**
+- ❌ Slower response (100ms delay)
+- ❌ Sensors read one at a time
+- ❌ Can feel "laggy" at high speeds
+
+---
+
+### **Version 2: Threaded (Advanced)**
+**File:** `tof_threaded_following.py`
+
+**How it reads sensors:**
+```python
+# Each sensor has its own thread reading continuously
+Thread 1: Back  sensor → reads every 50ms
+Thread 2: Left  sensor → reads every 50ms
+Thread 3: Right sensor → reads every 50ms
+Thread 4: Front sensor → reads every 50ms
+
+Main loop: Gets latest data from ALL sensors (instant!)
+```
+
+**Loop rate:** ~20 Hz (50ms per loop)
+
+**Pros:**
+- ✅ 2x faster response
+- ✅ All sensors update in parallel
+- ✅ Smoother driving at high speeds
+- ✅ Can detect obstacles faster
+
+**Cons:**
+- ❌ More complex code
+- ❌ Requires understanding of threading
+
+---
+
+## 🎛️ Tuning Parameters
+
+### **Track-Specific Settings:**
+
+```python
+# For 1-meter wide track (50cm from each wall)
+TARGET_WALL_DISTANCE = 500  # mm
+
+# For 80cm wide track
+TARGET_WALL_DISTANCE = 400  # mm
+
+# For 1.5m wide track
+TARGET_WALL_DISTANCE = 750  # mm
+```
+
+### **Steering Sensitivity:**
+
+```python
+STEERING_GAIN = 0.06  # Default (adjusted for ±40° servo limits)
+
+# If robot wobbles/oscillates:
+STEERING_GAIN = 0.04  # Gentler steering
+
+# If robot doesn't center well:
+STEERING_GAIN = 0.08  # More aggressive
+
+# If hitting walls:
+STEERING_GAIN = 0.10  # Maximum aggression
+```
+
+### **Servo Angle Limits:**
+
+```python
+MAX_STEERING_ANGLE = 40  # Your servo: -40° (right) to +40° (left)
+
+# Positive angle = Turn LEFT
+# Negative angle = Turn RIGHT
+```
+
+### **Speed Tuning:**
+
+```python
+NORMAL_SPEED = 180      # Straight sections
+CORNER_SPEED = 140      # During turns
+APPROACH_SPEED = 160    # Approaching corners
+
+# Too fast and hitting walls?
+NORMAL_SPEED = 160
+CORNER_SPEED = 120
+
+# Too slow?
+NORMAL_SPEED = 200
+CORNER_SPEED = 160
+```
+
+### **Distance Thresholds:**
+
+```python
+EMERGENCY_DISTANCE = 150      # 15cm - hard stop
+CORNER_FRONT_THRESHOLD = 300  # 30cm - slow down
+DEAD_END_THRESHOLD = 250      # 25cm - backup
+
+# Hitting front walls often?
+CORNER_FRONT_THRESHOLD = 400  # Slow down earlier
+```
+
+---
+
+## 🎮 Understanding the Logic
+
+### **Wall Centering Math:**
+
+```
+Track width: 1000mm (1 meter)
+Target: Stay centered at 500mm from each wall
+
+Scenario 1: Drifting right
+  Left:  600mm
+  Right: 400mm
+  Diff = 600 - 400 = +200mm
+  Steering = -200 × 0.06 = -12°  ← Turn RIGHT to recenter
+
+Scenario 2: Drifting left  
+  Left:  400mm
+  Right: 600mm
+  Diff = 400 - 600 = -200mm
+  Steering = -(-200) × 0.06 = +12°  ← Turn LEFT to recenter
+
+Scenario 3: Centered
+  Left:  500mm
+  Right: 500mm
+  Diff = 0mm
+  Steering = 0°  ← Go straight
+```
+
+### **Corner Detection:**
+
+```
+Normal corridor:
+  Front: 800mm  ← Plenty of space
+  Left:  500mm
+  Right: 500mm
+  Status: CLEAR → Full speed
+
+Approaching corner:
+  Front: 250mm  ← Wall ahead!
+  Left:  450mm
+  Right: 700mm  ← Right side more open
+  Status: CORNER_RIGHT → Slow down, prepare to turn right
+
+Dead end:
+  Front: 180mm  ← Very close!
+  Left:  450mm  ← Both walls present
+  Right: 480mm
+  Status: DEAD_END → STOP and backup!
+```
+
+---
+
+## 🚀 Quick Start
+
+### **1. Test Sensors First:**
+
+```python
+# Run just the sensor test from your working code
+python3 your_vl53l0x_test.py
+
+# Should see:
+# Back: 1234mm | Left: 567mm | Right: 890mm | Front: 432mm
+```
+
+### **2. Run Simple Version:**
+
+```bash
+python3 tof_path_following.py
+```
+
+**What you'll see:**
+```
+[    1] CLEAR           | Dir: STRAIGHT | Steer:   0.0° | Speed: 180 | F: 850 L: 520 R: 480 B: 900
+[    6] CLEAR           | Dir: LEFT     | Steer:  12.5° | Speed: 180 | F: 820 L: 600 R: 400 B: 890
+[   11] CORNER_AHEAD    | Dir: RIGHT    | Steer: -18.0° | Speed: 160 | F: 280 L: 450 R: 550 B: 880
+[   16] CORNER_RIGHT    | Dir: RIGHT    | Steer: -35.0° | Speed: 140 | F: 220 L: 350 R: 650 B: 870
+```
+
+### **3. If It Works Well, Try Threaded Version:**
+
+```bash
+python3 tof_threaded_following.py
+```
+
+**Benefits:** 2x faster response, smoother driving
+
+---
+
+## 🔧 Common Issues & Fixes
+
+### **Problem: Robot oscillates (wobbles left/right)**
+
+**Cause:** Steering too aggressive
+
+**Fix:**
+```python
+STEERING_GAIN = 0.04  # Lower from 0.06
+DEAD_ZONE = 80        # Increase from 50
+```
+
+### **Problem: Hits walls on corners**
+
+**Cause:** Not slowing down early enough
+
+**Fix:**
+```python
+CORNER_FRONT_THRESHOLD = 400  # Increase from 300
+CORNER_SPEED = 120            # Decrease from 140
+```
+
+### **Problem: Doesn't center, drifts to one side**
+
+**Cause:** Steering not strong enough
+
+**Fix:**
+```python
+STEERING_GAIN = 0.08  # Increase from 0.06
+```
+
+### **Problem: Stops too often (false emergencies)**
+
+**Cause:** Emergency distance too high
+
+**Fix:**
+```python
+EMERGENCY_DISTANCE = 120  # Decrease from 150
+```
+
+### **Problem: One sensor always shows "---" or 2000mm**
+
+**Cause:** Bad sensor connection or I2C address conflict
+
+**Fix:**
+1. Check wiring on that sensor
+2. Verify SHDN pin is correct
+3. Run I2C scan:
+```python
+import board
+i2c = board.I2C()
+if i2c.try_lock():
+    print([hex(x) for x in i2c.scan()])
+    i2c.unlock()
+```
+
+---
+
+## 📊 Performance Comparison
+
+| Metric | Simple Version | Threaded Version |
+|--------|---------------|------------------|
+| **Loop rate** | ~10 Hz (100ms) | ~20 Hz (50ms) |
+| **Sensor reads** | Sequential | Parallel |
+| **Response time** | 100-200ms | 50-100ms |
+| **CPU usage** | ~15% | ~25% |
+| **Complexity** | Low | Medium |
+| **Best for** | Learning, testing | Competition, high speed |
+
+---
+
+## 🎯 Recommended Settings for Different Tracks
+
+### **Wide Track (1.5m):**
+```python
+TARGET_WALL_DISTANCE = 750
+STEERING_GAIN = 0.05
+NORMAL_SPEED = 200
+```
+
+### **Standard Track (1m):**
+```python
+TARGET_WALL_DISTANCE = 500
+STEERING_GAIN = 0.06
+NORMAL_SPEED = 180
+```
+
+### **Narrow Track (0.8m):**
+```python
+TARGET_WALL_DISTANCE = 400
+STEERING_GAIN = 0.07
+NORMAL_SPEED = 160
+CORNER_SPEED = 120
+```
+
+### **Complex Track (many corners):**
+```python
+CORNER_FRONT_THRESHOLD = 400  # Detect early
+CORNER_SPEED = 130            # Slow down more
+APPROACH_SPEED = 150
+```
+
+---
+
+## ✅ Testing Checklist
+
+- [ ] All 4 sensors reading correctly
+- [ ] Servo moves: -40° right, +40° left
+- [ ] Motor forward/backward works
+- [ ] Switch turns robot on/off
+- [ ] Blue LED indicates running
+- [ ] Robot centers between walls
+- [ ] Slows down before corners
+- [ ] Turns in correct direction
+- [ ] Backs up from dead ends
+- [ ] Emergency stop works
+
+---
+
+## 🎓 Next Steps
+
+Once basic TOF following works:
+
+1. **Fine-tune parameters** for your specific track
+2. **Try threaded version** for better performance  
+3. **Add lap counting** (detect start/finish markers)
+4. **Combine with camera** (hybrid navigation)
+5. **Add acceleration profiles** (smooth speed changes)
