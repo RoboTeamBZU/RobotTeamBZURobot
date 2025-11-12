@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import time
 import os
 import math
@@ -16,10 +15,12 @@ from picamera2 import Picamera2
 import cv2
 import numpy as np
 
-
-IN1, IN2, ENA = 24, 23, 13        # motor driver pins 
-SERVO_PIN = 18                   # steering servo pin 
-SWITCH_PIN = 25                  # start/stop switch 
+# ============================================================================
+# CONFIG (DO NOT change GPIOs without telling me)
+# ============================================================================
+IN1, IN2, ENA = 24, 23, 13        # motor driver pins (unchanged)
+SERVO_PIN = 18                   # steering servo pin (unchanged)
+SWITCH_PIN = 25                  # start/stop switch (unchanged)
 LED_BLUE = 6
 
 XSHUT_PINS = [board.D22, board.D27, board.D17, board.D26]  # Right, Left, Back, Front
@@ -28,26 +29,12 @@ SENSOR_NAMES = ['Right', 'Left', 'Back', 'Front']
 # Motion & steering
 SPEED = 200           # motor PWM (0-255). Reduce for initial testing.
 MAX_STEER = 40        # degrees clamp for servo
-DEAD_ZONE = 80        # mm difference considered centered (TOF)
+DEAD_ZONE = 80        # mm difference considered centered
 
-# PD controller (tune during practice) - TOF and Camera separate
-PD_TOF_KP = 0.03
-PD_TOF_KD = 0.007
-
-PD_CAM_KP = 0.02
-PD_CAM_KD = 0.005
-
+# PD controller (tune during practice)
+PD_KP = 0.03
+PD_KD = 0.007
 PD_DT_MIN = 0.01
-
-# Camera tuning
-CAM_W, CAM_H = 640, 480
-CAM_CAL_FILE = "camera_cal.npz"  # optional undistort file; create with calibration script
-CAM_DEADZONE_PX = 8             # small pixel dead zone to avoid jitter
-CAM_ALPHA = 0.6                 # low-pass factor (0..1), higher = respond faster
-CAM_SCALE_TO_DEG = 0.06         # map PD output (px) to servo degrees; tune in practice
-
-# TOF -> angle scaling (map mm error to degrees)
-TOF_SCALE_TO_DEG = 0.03         # similar to original STEERING_GAIN; tune in practice
 
 # Corner detection thresholds (mm)
 FRONT_CLOSE = 180
@@ -58,15 +45,16 @@ SIDE_CLOSE = 350
 TURN_TARGET_DEG = 90
 TURN_TOLERANCE = 0.95
 TURN_TIMEOUT = 4.0  # seconds
-TURN_SPEED_FACTOR = 0.6  # fraction of SPEED to use during turns
 
-# Camera / sensor timing
-SENSOR_SAMPLE_DELAY = 0.01  # seconds between sensor reads (was 0.02)
-GYRO_CAL_DURATION = 1.0     # seconds to calibrate gyro bias
+# Camera
+CAM_W, CAM_H = 640, 480
+CAM_CAL_FILE = "camera_cal.npz"  # optional undistort file; create with calibration script
 
-# Logging
-LOGGING_ENABLED = False
-LOG_FILE = "robot_log.csv"
+# Sensor timing
+SENSOR_SAMPLE_DELAY = 0.02
+
+# Gyro calibration
+GYRO_CAL_DURATION = 1.0
 
 # ============================================================================
 # HARDWARE SETUP
@@ -91,7 +79,6 @@ def setup_sensors():
             vl53.append(sensor)
         except Exception as e:
             print(f"⚠️  VL53 init failed for {SENSOR_NAMES[i]}: {e}")
-            traceback.print_exc()
             vl53.append(None)
     print("✓ TOF Sensors ready")
     return vl53
@@ -127,7 +114,6 @@ def setup_mpu6050():
         return mpu
     except Exception as e:
         print(f"⚠️  MPU6050 not found: {e}")
-        traceback.print_exc()
         return None
 
 # ============================================================================
@@ -148,7 +134,7 @@ def stop_motor(pi):
 # SENSOR READS
 # ============================================================================
 def read_sensors(vl53):
-    """Read all 4 TOF sensors; clamp out-of-range to 1500 mm. Improved logging on errors."""
+    """Read all 4 TOF sensors; clamp out-of-range to 1500 mm."""
     distances = {}
     for i, sensor in enumerate(vl53):
         name = SENSOR_NAMES[i]
@@ -158,9 +144,7 @@ def read_sensors(vl53):
         try:
             d = sensor.range
             distances[name] = d if 10 <= d <= 1500 else 1500
-        except Exception as e:
-            print(f"VL53 read error {name}: {e}")
-            traceback.print_exc()
+        except Exception:
             distances[name] = 1500
         time.sleep(SENSOR_SAMPLE_DELAY)
     return distances
@@ -169,7 +153,7 @@ def read_sensors(vl53):
 # PD CONTROLLER
 # ============================================================================
 class PDController:
-    def __init__(self, kp=0.03, kd=0.007):
+    def __init__(self, kp=PD_KP, kd=PD_KD):
         self.kp = kp
         self.kd = kd
         self.last_error = 0.0
@@ -187,49 +171,40 @@ class PDController:
         self.last_time = t
         return output
 
-    def reset(self):
-        self.last_error = 0.0
-        self.last_time = None
-
 # ============================================================================
 # CAMERA (Picamera2) + OPTIONAL UNDISTORT
 # ============================================================================
 def init_camera():
     print("Initializing camera...")
-    picam2 = Picamera2()
-    camera_config = picam2.create_preview_configuration({"main":{"size": (CAM_W, CAM_H)}}, raw=False)
-    picam2.configure(camera_config)
-    picam2.start()
-    remap = None
-    if os.path.exists(CAM_CAL_FILE):
-        try:
-            data = np.load(CAM_CAL_FILE)
-            K = data['K']
-            D = data['D']
-            try:
-                map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K, (CAM_W, CAM_H), cv2.CV_16SC2)
-            except Exception:
-                map1, map2 = cv2.initUndistortRectifyMap(K, D, None, K, (CAM_W, CAM_H), cv2.CV_16SC2)
-            remap = (map1, map2)
-            print("✓ Camera calibration loaded")
-        except Exception as e:
-            print(f"⚠️ Failed loading camera calibration: {e}")
-            traceback.print_exc()
-    print("✓ Camera ready (Picamera2)")
-    return picam2, remap
-
-def camera_capture_frame(picam2, remap=None):
-    """Return BGR frame or None."""
     try:
-        arr = picam2.capture_array()
-        frame = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-        if remap is not None:
-            frame = cv2.remap(frame, remap[0], remap[1], interpolation=cv2.INTER_LINEAR)
-        return frame
+        picam2 = Picamera2()
+        camera_config = picam2.create_preview_configuration(main={"size": (CAM_W, CAM_H)})
+        picam2.configure(camera_config)
+        picam2.start()
+        time.sleep(0.5)  # Give camera time to warm up
+        
+        remap = None
+        if os.path.exists(CAM_CAL_FILE):
+            try:
+                data = np.load(CAM_CAL_FILE)
+                K = data['K']
+                D = data['D']
+                try:
+                    map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K, (CAM_W, CAM_H), cv2.CV_16SC2)
+                except Exception:
+                    map1, map2 = cv2.initUndistortRectifyMap(K, D, None, K, (CAM_W, CAM_H), cv2.CV_16SC2)
+                remap = (map1, map2)
+                print("✓ Camera calibration loaded")
+            except Exception as e:
+                print(f"⚠️ Failed loading camera calibration: {e}")
+                traceback.print_exc()
+        print("✓ Camera ready (Picamera2)")
+        return picam2, remap
     except Exception as e:
-        print(f"Camera capture error: {e}")
+        print(f"⚠️ Camera initialization failed: {e}")
+        print("  Robot will run using TOF sensors only")
         traceback.print_exc()
-        return None
+        return None, None
 
 # ============================================================================
 # SIMPLE WALL DETECTION (camera)
@@ -276,8 +251,10 @@ def detect_walls_from_camera(frame):
         right_cx = right_box[0] + right_box[2] // 2
         lane_center_px = (left_cx + right_cx) / 2.0
         error_px = lane_center_px - (w / 2.0)
+        # Return pixel-space error (PD controller tuned accordingly)
         return error_px
     else:
+        # If only one wall is visible, we can't compute lane center reliably -> fallback
         return None
 
 # ============================================================================
@@ -310,14 +287,12 @@ def calibrate_gyro(mpu, duration=GYRO_CAL_DURATION):
     print(f"✓ Gyro bias (rad/s): {bias:.6f}  (~{bias*57.2958:.3f} °/s)")
     return bias
 
-def turn_90(pi, servo, mpu, bias_z, direction, speed=None):
+def turn_90(pi, servo, mpu, bias_z, direction, speed=SPEED):
     """Perform ~90° turn by integrating gyro z; with timeout and bias compensation."""
     if not mpu:
         print("⚠️ No MPU - cannot perform gyro turn")
         return False
-    if speed is None:
-        speed = int(max(40, SPEED * TURN_SPEED_FACTOR))
-    print(f"\n🔄 Turning {direction.upper()} {TURN_TARGET_DEG}° (speed={speed}) ...")
+    print(f"\n🔄 Turning {direction.upper()} {TURN_TARGET_DEG}° ...")
     servo.angle = -MAX_STEER if direction == 'left' else MAX_STEER
     target = -TURN_TARGET_DEG if direction == 'left' else TURN_TARGET_DEG
 
@@ -354,41 +329,25 @@ def apply_steering(servo, angle):
     """Safe servo set with clamp."""
     servo.angle = max(-MAX_STEER, min(MAX_STEER, angle))
 
-def open_logger():
-    if not LOGGING_ENABLED:
-        return None
-    write_header = not os.path.exists(LOG_FILE)
-    f = open(LOG_FILE, "a", buffering=1)
-    if write_header:
-        f.write("ts,right,left,front,cam_error_px,angle_deg\n")
-    return f
-
 # ============================================================================
 # MAIN
 # ============================================================================
 def main():
     print("="*60)
-    print("WRO 2025 - Open Challenge - Improved wall following + gyro turns")
+    print("WRO 2025 - Open Challenge - Simple Wall Following + Gyro 90° turns")
     print("="*60)
 
     # Init hardware
     vl53 = setup_sensors()
     pi, servo = setup_motor_servo()
     mpu = setup_mpu6050()
-
-    # PD controllers: separate for camera and TOF
-    pd_cam = PDController(kp=PD_CAM_KP, kd=PD_CAM_KD)
-    pd_tof = PDController(kp=PD_TOF_KP, kd=PD_TOF_KD)
+    pd = PDController(kp=PD_KP, kd=PD_KD)
 
     # Camera
     picam2, remap = init_camera()
 
     # Calibrate gyro bias if possible
     gyro_bias = calibrate_gyro(mpu) if mpu else 0.0
-
-    # Logger
-    logger = open_logger()
-    cam_error_filtered = 0.0
 
     # Wait for Start button (SWITCH_PIN). According to WRO, robot must wait after power on.
     print("\nWaiting for Start button (press to RUN)...")
@@ -402,106 +361,79 @@ def main():
 
     try:
         while True:
-            try:
-                # If switch released, pause motors
-                if GPIO.input(SWITCH_PIN) == 1:
-                    stop_motor(pi)
-                    servo.angle = 0
-                    GPIO.output(LED_BLUE, GPIO.LOW)
-                    time.sleep(0.05)
-                    continue
-                GPIO.output(LED_BLUE, GPIO.HIGH)
-
-                # Read TOF sensors
-                distances = read_sensors(vl53)
-
-                # Capture camera frame and compute error (pixel space)
-                frame = camera_capture_frame(picam2, remap)
-                cam_error = detect_walls_from_camera(frame) if frame is not None else None
-
-                # Safety: emergency front stop
-                if distances['Front'] < 80:
-                    print("‼️ FRONT TOO CLOSE - stopping")
-                    stop_motor(pi)
-                    servo.angle = 0
-                    time.sleep(0.2)
-                    continue
-
-                # Corner detection via TOF (reliable short-range)
-                corner = detect_corner(distances)
-                if corner and mpu:
-                    stop_motor(pi)
-                    time.sleep(0.12)
-                    # use reduced speed for turn for safety
-                    turn_speed = int(max(40, SPEED * TURN_SPEED_FACTOR))
-                    success = turn_90(pi, servo, mpu, gyro_bias, corner, speed=turn_speed)
-                    # Reset PD controllers after a turn
-                    pd_cam.reset()
-                    pd_tof.reset()
-                    cam_error_filtered = 0.0
-                    if not success:
-                        print("⚠️ Turn failed - brief pause")
-                        time.sleep(0.5)
-                    continue
-
-                # Steering: prefer camera error; fallback to TOF diff
-                if cam_error is not None:
-                    # Apply camera dead zone
-                    if abs(cam_error) < CAM_DEADZONE_PX:
-                        cam_value = 0.0
-                    else:
-                        cam_value = cam_error
-                    # Low-pass filter
-                    cam_error_filtered = CAM_ALPHA * cam_value + (1.0 - CAM_ALPHA) * cam_error_filtered
-                    # PD update on filtered pixel error
-                    pd_out = pd_cam.update(cam_error_filtered)
-                    # Map PD output (px-space) to degrees
-                    angle = max(-MAX_STEER, min(MAX_STEER, pd_out * CAM_SCALE_TO_DEG))
-                else:
-                    diff = distances['Right'] - distances['Left']
-                    if abs(diff) < DEAD_ZONE:
-                        angle = 0.0
-                    else:
-                        pd_out = pd_tof.update(diff)
-                        angle = max(-MAX_STEER, min(MAX_STEER, pd_out * TOF_SCALE_TO_DEG))
-
-                apply_steering(servo, angle)
-                run_motor(pi, SPEED)
-
-                # Status print
-                if abs(angle) < 5:
-                    action = "STRAIGHT"
-                elif angle > 0:
-                    action = f"RIGHT {abs(angle):.0f}°"
-                else:
-                    action = f"LEFT {abs(angle):.0f}°"
-
-                # print distances & action
-                print(f"{distances['Right']:4} | {distances['Left']:4} | {distances['Front']:4} | "
-                      f"{angle:6.1f}° | {action}")
-                if cam_error is not None:
-                    print(f"  📷 Camera working: {cam_error:.1f}px (filt: {cam_error_filtered:.1f})")
-
-                # Logging (optional)
-                if logger:
-                    ts = time.time()
-                    log_cam = cam_error if cam_error is not None else ""
-                    logger.write(f"{ts},{distances['Right']},{distances['Left']},{distances['Front']},{log_cam},{angle}\n")
-
+            # If switch released, pause motors
+            if GPIO.input(SWITCH_PIN) == 1:
+                stop_motor(pi)
+                servo.angle = 0
+                GPIO.output(LED_BLUE, GPIO.LOW)
                 time.sleep(0.05)
+                continue
+            GPIO.output(LED_BLUE, GPIO.HIGH)
 
-            except Exception as e:
-                print("Runtime loop exception:", e)
-                traceback.print_exc()
-                # small pause to avoid busy-looping on persistent error
-                time.sleep(0.5)
+            # Read TOF sensors
+            distances = read_sensors(vl53)
+
+            # Capture camera frame and compute error (pixel space)
+            frame = camera_capture_frame(picam2, remap)
+            cam_error = detect_walls_from_camera(frame) if frame is not None else None
+
+            # Safety: emergency front stop
+            if distances['Front'] < 80:
+                print("‼️ FRONT TOO CLOSE - stopping")
+                stop_motor(pi)
+                servo.angle = 0
+                time.sleep(0.2)
+                continue
+
+           # Corner detection via TOF (reliable short-range)
+            corner = detect_corner(distances)
+            if corner and mpu:
+                stop_motor(pi)
+                time.sleep(0.12)
+                success = turn_90(pi, servo, mpu, gyro_bias, corner)
+                pd.last_error = 0.0
+                pd.last_time = None
+                if not success:
+                    print("⚠️ Turn failed - brief pause")
+                    time.sleep(0.5)
+                continue
+
+            # Steering: prefer camera error; fallback to TOF diff
+            if cam_error is not None:
+                control_out = pd.update(cam_error)
+            else:
+                diff = distances['Right'] - distances['Left']
+                if abs(diff) < DEAD_ZONE:
+                    control_out = 0.0
+                else:
+                    control_out = pd.update(diff)
+
+            # Map control_out to servo angle directly (tune PD gains to produce reasonable range)
+            angle = max(-MAX_STEER, min(MAX_STEER, control_out))
+            apply_steering(servo, angle)
+            run_motor(pi, SPEED)
+
+           # Status print
+            if abs(angle) < 5:
+                action = "STRAIGHT"
+            elif angle > 0:
+                action = f"RIGHT {abs(angle):.0f}°"
+            else:
+                action = f"LEFT {abs(angle):.0f}°"
+
+            print(f"{distances['Right']:4} | {distances['Left']:4} | {distances['Front']:4} | "
+                  f"{angle:6.1f}° | {action}")
+            
+            # ← ADD THESE 3 LINES HERE:
+            if cam_error is not None:
+                print(f"  📷 Camera working: {cam_error:.1f}px error")
+            
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
         print("\n\nStopped by user")
 
     finally:
-        if logger:
-            logger.close()
         stop_motor(pi)
         servo.angle = 0
         GPIO.output(LED_BLUE, GPIO.LOW)
