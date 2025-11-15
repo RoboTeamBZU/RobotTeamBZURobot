@@ -3,6 +3,7 @@ import time
 import os
 import math
 import traceback
+import threading
 import board
 from digitalio import DigitalInOut
 from adafruit_vl53l0x import VL53L0X
@@ -14,6 +15,7 @@ from gpiozero.pins.pigpio import PiGPIOFactory
 from picamera2 import Picamera2
 import cv2
 import numpy as np
+from flask import Flask, Response, render_template_string
 
 # ============================================================================
 # CONFIG (DO NOT change GPIOs without telling me)
@@ -55,6 +57,166 @@ SENSOR_SAMPLE_DELAY = 0.02
 
 # Gyro calibration
 GYRO_CAL_DURATION = 1.0
+
+# Flask streaming
+FLASK_PORT = 5000
+ENABLE_STREAM = True  # Set to False to disable streaming
+
+# ============================================================================
+# GLOBAL VARIABLES FOR STREAMING
+# ============================================================================
+latest_frame = None
+frame_lock = threading.Lock()
+stream_overlay_data = {}
+
+# ============================================================================
+# FLASK APP SETUP
+# ============================================================================
+app = Flask(__name__)
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WRO Robot Debug Stream</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/feather-icons"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+<main class="container mx-auto px-4 py-8">
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-bold text-indigo-400 mb-4">🚗 WRO Robot Debug Stream</h1>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Video Feed -->
+            <div class="lg:col-span-2">
+                <div class="relative bg-gray-800 rounded-xl overflow-hidden shadow-2xl">
+                    <div class="aspect-video">
+                        <img id="video-feed" src="{{ url_for('video_feed') }}" 
+                             class="w-full h-full object-cover" 
+                             alt="Live camera feed">
+                    </div>
+                    <div class="absolute top-4 left-4 bg-black bg-opacity-70 text-white px-3 py-2 rounded-lg text-sm">
+                        <div class="flex items-center gap-2">
+                            <div class="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
+                            <span class="font-medium">LIVE</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Sensor Data -->
+            <div class="space-y-4">
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">📡 TOF Sensors (mm)</h3>
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Front:</span>
+                            <span id="sensor-front" class="text-white font-mono text-lg">---</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Left:</span>
+                            <span id="sensor-left" class="text-white font-mono text-lg">---</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Right:</span>
+                            <span id="sensor-right" class="text-white font-mono text-lg">---</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Back:</span>
+                            <span id="sensor-back" class="text-white font-mono text-lg">---</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">🎮 Control Status</h3>
+                    <div class="space-y-2">
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Steering:</span>
+                            <span id="steering" class="text-white font-mono">0°</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Action:</span>
+                            <span id="action" class="text-green-400 font-medium">READY</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-400">Camera Error:</span>
+                            <span id="cam-error" class="text-white font-mono">---</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="bg-gray-800 p-4 rounded-lg">
+                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">ℹ️ Info</h3>
+                    <div class="text-sm text-gray-400 space-y-1">
+                        <p>• Red overlay = Detected walls</p>
+                        <p>• Green line = Lane center</p>
+                        <p>• Blue line = Target center</p>
+                        <p>• Resolution: 640×480</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+<script>
+feather.replace();
+
+// Poll sensor data every 200ms
+setInterval(() => {
+    fetch('/sensor_data')
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById('sensor-front').textContent = data.front || '---';
+            document.getElementById('sensor-left').textContent = data.left || '---';
+            document.getElementById('sensor-right').textContent = data.right || '---';
+            document.getElementById('sensor-back').textContent = data.back || '---';
+            document.getElementById('steering').textContent = data.steering || '0°';
+            document.getElementById('action').textContent = data.action || 'READY';
+            document.getElementById('cam-error').textContent = data.cam_error || '---';
+        })
+        .catch(err => console.error('Failed to fetch sensor data:', err));
+}, 200);
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+@app.route('/video_feed')
+def video_feed():
+    def gen_frames():
+        while True:
+            with frame_lock:
+                if latest_frame is not None:
+                    frame = latest_frame.copy()
+                else:
+                    time.sleep(0.05)
+                    continue
+            
+            # Encode to JPEG
+            ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ret:
+                continue
+            
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/sensor_data')
+def sensor_data():
+    return stream_overlay_data
+
+def start_flask_server():
+    """Start Flask server in a background thread."""
+    app.run(host='0.0.0.0', port=FLASK_PORT, threaded=True, debug=False, use_reloader=False)
 
 # ============================================================================
 # HARDWARE SETUP
@@ -206,18 +368,42 @@ def init_camera():
         traceback.print_exc()
         return None, None
 
+def camera_capture_frame(picam2, remap):
+    """
+    Capture a frame from Picamera2 and optionally apply undistortion.
+    Returns BGR frame or None on failure.
+    """
+    if picam2 is None:
+        return None
+    try:
+        frame = picam2.capture_array()
+        # Convert RGB to BGR for OpenCV
+        if frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        elif frame.shape[2] == 4:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        
+        # Apply undistortion if calibration maps are available
+        if remap is not None:
+            map1, map2 = remap
+            frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        
+        return frame
+    except Exception as e:
+        return None
+
 # ============================================================================
-# SIMPLE WALL DETECTION (camera)
+# SIMPLE WALL DETECTION (camera) + VISUALIZATION
 # ============================================================================
-def detect_walls_from_camera(frame):
+def detect_walls_from_camera(frame, visualize=False):
     """
     Detect left & right wall contours in a horizontal ROI and return lateral error (px).
-    Positive error -> lane center is right of image center (robot is too far left),
-    Negative error -> lane center is left of image center.
-    Returns None on failure.
+    If visualize=True, draws detection overlays on the frame.
+    Returns (error_px, annotated_frame) or (None, frame)
     """
     if frame is None:
-        return None
+        return None, frame
+    
     h, w = frame.shape[:2]
     y1 = int(h * 0.35)
     y2 = int(h * 0.65)
@@ -234,12 +420,12 @@ def detect_walls_from_camera(frame):
 
     contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return None
+        return None, frame
 
     min_area = (w * (y2-y1)) * 0.01
     large = [c for c in contours if cv2.contourArea(c) > min_area]
     if not large:
-        return None
+        return None, frame
 
     boxes = [cv2.boundingRect(c) for c in large]
     boxes = sorted(boxes, key=lambda b: b[0])
@@ -247,15 +433,38 @@ def detect_walls_from_camera(frame):
     right_box = boxes[-1] if len(boxes) > 1 else None
 
     left_cx = left_box[0] + left_box[2] // 2
+    
+    if visualize:
+        # Draw ROI boundaries
+        cv2.rectangle(frame, (0, y1), (w, y2), (255, 255, 0), 2)
+        
+        # Draw detected wall boxes
+        cv2.rectangle(frame, 
+                      (left_box[0], y1 + left_box[1]), 
+                      (left_box[0] + left_box[2], y1 + left_box[1] + left_box[3]),
+                      (0, 0, 255), 2)
+        
+        if right_box is not None:
+            cv2.rectangle(frame, 
+                          (right_box[0], y1 + right_box[1]), 
+                          (right_box[0] + right_box[2], y1 + right_box[1] + right_box[3]),
+                          (0, 0, 255), 2)
+    
     if right_box is not None:
         right_cx = right_box[0] + right_box[2] // 2
         lane_center_px = (left_cx + right_cx) / 2.0
         error_px = lane_center_px - (w / 2.0)
-        # Return pixel-space error (PD controller tuned accordingly)
-        return error_px
+        
+        if visualize:
+            # Draw lane center (green) and target center (blue)
+            cv2.line(frame, (int(lane_center_px), 0), (int(lane_center_px), h), (0, 255, 0), 2)
+            cv2.line(frame, (w//2, 0), (w//2, h), (255, 0, 0), 2)
+            cv2.putText(frame, f"Error: {error_px:.1f}px", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        return error_px, frame
     else:
-        # If only one wall is visible, we can't compute lane center reliably -> fallback
-        return None
+        return None, frame
 
 # ============================================================================
 # CORNER DETECTION & TURNING (gyro)
@@ -333,6 +542,8 @@ def apply_steering(servo, angle):
 # MAIN
 # ============================================================================
 def main():
+    global latest_frame, stream_overlay_data
+    
     print("="*60)
     print("WRO 2025 - Open Challenge - Simple Wall Following + Gyro 90° turns")
     print("="*60)
@@ -345,6 +556,14 @@ def main():
 
     # Camera
     picam2, remap = init_camera()
+
+    # Start Flask streaming server
+    if ENABLE_STREAM and picam2:
+        print(f"\n🌐 Starting Flask stream server on port {FLASK_PORT}...")
+        flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+        flask_thread.start()
+        print(f"✓ Stream available at: http://<your-pi-ip>:{FLASK_PORT}")
+        time.sleep(1)
 
     # Calibrate gyro bias if possible
     gyro_bias = calibrate_gyro(mpu) if mpu else 0.0
@@ -366,6 +585,7 @@ def main():
                 stop_motor(pi)
                 servo.angle = 0
                 GPIO.output(LED_BLUE, GPIO.LOW)
+                stream_overlay_data = {"action": "PAUSED"}
                 time.sleep(0.05)
                 continue
             GPIO.output(LED_BLUE, GPIO.HIGH)
@@ -375,20 +595,27 @@ def main():
 
             # Capture camera frame and compute error (pixel space)
             frame = camera_capture_frame(picam2, remap)
-            cam_error = detect_walls_from_camera(frame) if frame is not None else None
+            cam_error, annotated_frame = detect_walls_from_camera(frame, visualize=True)
+            
+            # Update stream frame
+            if ENABLE_STREAM and annotated_frame is not None:
+                with frame_lock:
+                    latest_frame = annotated_frame
 
             # Safety: emergency front stop
             if distances['Front'] < 80:
                 print("‼️ FRONT TOO CLOSE - stopping")
                 stop_motor(pi)
                 servo.angle = 0
+                stream_overlay_data = {"action": "EMERGENCY STOP", "front": distances['Front']}
                 time.sleep(0.2)
                 continue
 
-           # Corner detection via TOF (reliable short-range)
+            # Corner detection via TOF (reliable short-range)
             corner = detect_corner(distances)
             if corner and mpu:
                 stop_motor(pi)
+                stream_overlay_data = {"action": f"TURNING {corner.upper()}"}
                 time.sleep(0.12)
                 success = turn_90(pi, servo, mpu, gyro_bias, corner)
                 pd.last_error = 0.0
@@ -413,7 +640,7 @@ def main():
             apply_steering(servo, angle)
             run_motor(pi, SPEED)
 
-           # Status print
+            # Status print
             if abs(angle) < 5:
                 action = "STRAIGHT"
             elif angle > 0:
@@ -424,9 +651,19 @@ def main():
             print(f"{distances['Right']:4} | {distances['Left']:4} | {distances['Front']:4} | "
                   f"{angle:6.1f}° | {action}")
             
-            # ← ADD THESE 3 LINES HERE:
             if cam_error is not None:
                 print(f"  📷 Camera working: {cam_error:.1f}px error")
+            
+            # Update stream overlay data
+            stream_overlay_data = {
+                "front": distances['Front'],
+                "left": distances['Left'],
+                "right": distances['Right'],
+                "back": distances['Back'],
+                "steering": f"{angle:.1f}°",
+                "action": action,
+                "cam_error": f"{cam_error:.1f}px" if cam_error is not None else "TOF Mode"
+            }
             
             time.sleep(0.05)
 
