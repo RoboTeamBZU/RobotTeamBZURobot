@@ -21,8 +21,8 @@ time.sleep(2)
 class SteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
-        self.max_rate = 5.0      # Maximum degrees per frame to change
-        self.deadzone = 50       # Ignore small differences (noise reduction)
+        self.max_rate = 1.0      # Maximum degrees per frame to change
+        self.deadzone = 1000     # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle (adjust this!)
         
     def update(self, left_pixels, right_pixels):
@@ -176,7 +176,7 @@ def gen_frames():
         
         # Draw a rotating arrow showing target heading
         arrow_length = 60
-        arrow_angle_rad = -target_angle * 3.14159 / 180  # Convert to radians, flip for screen coords
+        arrow_angle_rad = target_angle * 3.14159 / 180  # Convert to radians (removed minus sign)
         end_x = int(center_x + arrow_length * np.sin(arrow_angle_rad))
         end_y = int(indicator_y - arrow_length * np.cos(arrow_angle_rad))
         
@@ -259,9 +259,9 @@ HTML_PAGE = """
                         <div>
                             <div class="flex justify-between mb-1">
                                 <span class="text-gray-400">Deadzone (pixels)</span>
-                                <span class="text-white" id="dead-value">50</span>
+                                <span class="text-white" id="dead-value">1000</span>
                             </div>
-                            <input type="range" id="dead-slider" min="0" max="200" value="50" 
+                            <input type="range" id="dead-slider" min="100" max="5000" value="1000" 
                                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer"
                                    onchange="updateDead(this.value)">
                             <div class="text-xs text-gray-500 mt-1">Ignore small differences</div>
