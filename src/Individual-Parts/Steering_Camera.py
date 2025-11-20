@@ -51,8 +51,8 @@ time.sleep(2)
 class VisionSteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
-        self.max_rate = 5.0      # Maximum degrees per frame to change
-        self.deadzone = 50       # Ignore small differences (noise reduction)
+        self.max_rate = 2.0      # Maximum degrees per frame to change
+        self.deadzone = 1000       # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle
         self.lock = threading.Lock()
         
@@ -127,8 +127,8 @@ class GyroSteeringController:
             SERVO_PIN,
             min_angle=SERVO_MAX_LEFT,
             max_angle=SERVO_MAX_RIGHT,
-            min_pulse_width=0.0005,
-            max_pulse_width=0.0025
+            min_pulse_width=0.0012,
+            max_pulse_width=0.0017
         )
         
         # Initialize MPU6050
@@ -300,7 +300,8 @@ def load_roi_config(path="roi_config.json"):
             "ignore_Top": 20,
             "Corner_LM": 0,
             "Corner_RM": 100,
-            "Wall_Top": 30,
+            "Right_Wall_Top": 40,
+            "Left_Wall_Top": 30,
             "Wall_Bottom": 70,
             "Right_Wall_RM": 100,
             "Right_Wall_LM": 70,
@@ -328,7 +329,8 @@ def gen_frames():
         # ---- ROI pixel boundaries ----
         Ct = int(h * zones["Corner_Top"] / 100)
         Cb = int(h * zones["Corner_Bottom"] / 100)
-        Wt = int(h * zones["Wall_Top"] / 100)
+        RWt = int(h * zones["Right_Wall_Top"] / 100)
+        LWt = int(h * zones["Left_Wall_Top"] / 100)
         Wb = int(h * zones["Wall_Bottom"] / 100)
 
         Clm = int(w * zones["Corner_LM"] / 100)
@@ -343,8 +345,8 @@ def gen_frames():
 
         # Extract ROIs
         corner_roi = mask[Ct:Cb, Clm:Crm]
-        left_roi   = mask[Wt:Wb, Llm:Lrm]
-        right_roi  = mask[Wt:Wb, Rlm:Rrm]
+        left_roi   = mask[LWt:Wb, Llm:Lrm]
+        right_roi  = mask[RWt:Wb, Rlm:Rrm]
 
         # Count pixels
         corner_pixels = cv2.countNonZero(corner_roi)
@@ -358,8 +360,8 @@ def gen_frames():
 
         # ---------------- DRAW ROI boxes ------------------------
         cv2.rectangle(frame, (Clm, Ct), (Crm, Cb), (0, 255, 0), 2)      # Corner
-        cv2.rectangle(frame, (Llm, Wt), (Lrm, Wb), (255, 0, 0), 2)      # Left
-        cv2.rectangle(frame, (Rlm, Wt), (Rrm, Wb), (0, 0, 255), 2)      # Right
+        cv2.rectangle(frame, (Llm, LWt), (Lrm, Wb), (255, 0, 0), 2)      # Left
+        cv2.rectangle(frame, (Rlm, RWt), (Rrm, Wb), (0, 0, 255), 2)      # Right
 
         # ---- Draw pixel count text on each ROI ----
         cv2.putText(frame, f"C:{corner_pixels}",
@@ -367,11 +369,11 @@ def gen_frames():
                     0.5, (0,255,0), 2)
 
         cv2.putText(frame, f"L:{left_pixels}",
-                    (Llm, Wt - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    (Llm, LWt - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (255,0,0), 2)
 
         cv2.putText(frame, f"R:{right_pixels}",
-                    (Rlm, Wt - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    (Rlm, RWt - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0,0,255), 2)
 
         # ------------------- Display Steering Info -------------------
@@ -882,3 +884,4 @@ if __name__ == "__main__":
     finally:
         gyro_steering.cleanup()
         print("Cleanup complete")
+
