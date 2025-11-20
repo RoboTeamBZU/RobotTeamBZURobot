@@ -11,11 +11,11 @@ SERVO_PIN = 18
 IN1, IN2, ENA = 24, 23, 13
 
 # Servo limits
-SERVO_MAX_RIGHT = 40
-SERVO_MAX_LEFT = -40
+SERVO_MAX_RIGHT = 20
+SERVO_MAX_LEFT = -20
 
 # Motor settings
-DEFAULT_MOTOR_SPEED = 180
+DEFAULT_MOTOR_SPEED = 200
 
 # PID Controller parameters
 KP = 0.8
@@ -54,6 +54,7 @@ class GyroSteering:
         
         # State variables
         self.current_heading = 0.0
+        self.cumulative_rotation = 0.0  # Tracks total rotation (no limits)
         self.target_heading = 0.0
         self.last_time = time.time()
         self.integral = 0.0
@@ -91,29 +92,25 @@ class GyroSteering:
         
         gyro_z = (self.mpu.gyro[2] - self.gyro_z_offset) * GYRO_DIRECTION
         heading_change = math.degrees(gyro_z * dt)
-        self.current_heading += heading_change
-        self.current_heading = (self.current_heading + 180) % 360 - 180
         
-    def calculate_steering_angle(self):
-        error = self.target_heading - self.current_heading
+        # Update both heading (normalized) and cumulative rotation (unlimited)
+        self.cumulative_rotation += heading_change
+        self.current_heading = (self.current_heading + heading_change + 180) % 360 - 180
         
-        if error > 180:
-            error -= 360
-        elif error < -180:
-            error += 360
-            
+    def calculate_steering_angle(self, error):
         self.integral += error
         self.integral = max(min(self.integral, 100), -100)
         
         derivative = error - self.last_error
         self.last_error = error
         
-        steering = (KP * error + KI * self.integral + KD * derivative) * SERVO_DIRECTION
-        steering = max(min(steering, SERVO_MAX_RIGHT), SERVO_MAX_LEFT)
+        raw_steering = (KP * error + KI * self.integral + KD * derivative) * SERVO_DIRECTION
+        steering = max(min(raw_steering, SERVO_MAX_RIGHT), SERVO_MAX_LEFT)
         
-        return steering, error
+        return steering
         
     def steer_to_heading(self, target_heading, speed=DEFAULT_MOTOR_SPEED, tolerance=2.0, timeout=10.0):
+        """Steer to normalized heading (-180 to 180)"""
         self.target_heading = target_heading
         self.integral = 0.0
         self.last_error = 0.0
@@ -123,7 +120,15 @@ class GyroSteering:
         
         while True:
             self.update_heading()
-            steering_angle, error = self.calculate_steering_angle()
+            
+            # Calculate shortest path error
+            error = self.target_heading - self.current_heading
+            if error > 180:
+                error -= 360
+            elif error < -180:
+                error += 360
+            
+            steering_angle = self.calculate_steering_angle(error)
             self.servo.angle = steering_angle
             
             print(f"Current: {self.current_heading:6.1f}° | "
@@ -145,6 +150,44 @@ class GyroSteering:
                 return False
                 
             time.sleep(0.02)
+    
+    def rotate_degrees(self, degrees, speed=DEFAULT_MOTOR_SPEED, tolerance=2.0, timeout=30.0):
+        """Rotate by a specific number of degrees (can be > 360 or < -360)"""
+        target_rotation = self.cumulative_rotation + degrees
+        self.integral = 0.0
+        self.last_error = 0.0
+        start_time = time.time()
+        
+        self.run_motor(speed)
+        
+        while True:
+            self.update_heading()
+            
+            # Error based on cumulative rotation (no normalization)
+            error = target_rotation - self.cumulative_rotation
+            
+            steering_angle = self.calculate_steering_angle(error)
+            self.servo.angle = steering_angle
+            
+            print(f"Rotated: {self.cumulative_rotation:7.1f}° | "
+                  f"Target: {target_rotation:7.1f}° | "
+                  f"Remaining: {error:6.1f}° | "
+                  f"Servo: {steering_angle:6.1f}° | "
+                  f"Speed: {self.current_speed}/255", end='\r')
+            
+            if abs(error) < tolerance:
+                print(f"\nRotation complete! Total rotated: {self.cumulative_rotation:.1f}°")
+                self.stop_motor()
+                self.servo.angle = 0
+                return True
+                
+            if time.time() - start_time > timeout:
+                print(f"\nTimeout! Rotated: {self.cumulative_rotation:.1f}°")
+                self.stop_motor()
+                self.servo.angle = 0
+                return False
+                
+            time.sleep(0.02)
             
     def cleanup(self):
         self.stop_motor()
@@ -160,20 +203,36 @@ def main():
         steering.calibrate_gyro()
         time.sleep(1)
         steering.current_heading = 0.0
+        steering.cumulative_rotation = 0.0
         steering.last_time = time.time()
         
+        print("\nControls:")
+        print("  Enter number for cumulative rotation (e.g., 200, 360, 1000, -500)")
+        print("  Enter 'h [angle]' for heading mode (e.g., 'h 90' for northeast)")
+        print("  Enter 'q' to quit\n")
+        
         while True:
-            user_input = input("\nEnter angle (-180 to 180) or 'q' to quit: ").strip()
+            user_input = input("Enter command: ").strip()
             
             if user_input.lower() == 'q':
                 break
+            
+            # Check for heading mode
+            if user_input.lower().startswith('h '):
+                try:
+                    target = float(user_input.split()[1])
+                    if -180 <= target <= 180:
+                        steering.steer_to_heading(target, speed=motor_speed)
+                    else:
+                        print("Heading must be between -180 and 180")
+                except (ValueError, IndexError):
+                    print("Invalid heading command. Use format: h [angle]")
+                continue
                 
+            # Default: cumulative rotation mode
             try:
-                target = float(user_input)
-                if -180 <= target <= 180:
-                    steering.steer_to_heading(target, speed=motor_speed)
-                else:
-                    print("Please enter a value between -180 and 180")
+                degrees = float(user_input)
+                steering.rotate_degrees(degrees, speed=motor_speed)
             except ValueError:
                 print("Invalid input")
                 
