@@ -25,10 +25,10 @@ SERVO_MAX_RIGHT = 40
 SERVO_MAX_LEFT = -40
 
 # Motor settings
-DEFAULT_MOTOR_SPEED = 150
+DEFAULT_MOTOR_SPEED = 180
 
 # PID Controller parameters
-KP = 0.1
+KP = 0.8
 KI = 0.01
 KD = 0.3
 
@@ -51,8 +51,8 @@ time.sleep(2)
 class VisionSteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
-        self.max_rate = 1.0      # Maximum degrees per frame to change
-        self.deadzone = 1000       # Ignore small differences (noise reduction)
+        self.max_rate = 5.0      # Maximum degrees per frame to change
+        self.deadzone = 50       # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle
         self.lock = threading.Lock()
         
@@ -137,6 +137,7 @@ class GyroSteeringController:
         
         # State variables
         self.current_heading = 0.0
+        self.cumulative_rotation = 0.0  # Tracks total rotation (no limits)
         self.target_heading = 0.0
         self.last_time = time.time()
         self.integral = 0.0
@@ -195,17 +196,17 @@ class GyroSteeringController:
         heading_change = math.degrees(gyro_z_corrected * dt)
         
         with self.lock:
-            self.current_heading += heading_change
-            self.current_heading = (self.current_heading + 180) % 360 - 180
+            # Update both heading (normalized) and cumulative rotation (unlimited)
+            self.cumulative_rotation += heading_change
+            self.current_heading = (self.current_heading + heading_change + 180) % 360 - 180
         
     def calculate_steering_angle(self, target_heading):
         with self.lock:
-            error = target_heading - self.current_heading
+            # Calculate error based on cumulative rotation (no normalization for vision tracking)
+            error = target_heading - self.cumulative_rotation
         
-        if error > 180:
-            error -= 360
-        elif error < -180:
-            error += 360
+        # Note: We don't normalize the error here because vision target is cumulative
+        # This allows the robot to track continuous rotation beyond ±180°
             
         self.integral += error
         self.integral = max(min(self.integral, 100), -100)
@@ -223,13 +224,15 @@ class GyroSteeringController:
             return self.current_heading
     
     def get_gyro_data(self):
-        """Return raw gyro rotation rates"""
-        return {
-            'x': self.gyro_x,
-            'y': self.gyro_y, 
-            'z': self.gyro_z,
-            'heading': self.get_current_heading()
-        }
+        """Return raw gyro rotation rates and both heading types"""
+        with self.lock:
+            return {
+                'x': self.gyro_x,
+                'y': self.gyro_y, 
+                'z': self.gyro_z,
+                'heading': self.current_heading,
+                'cumulative': self.cumulative_rotation
+            }
     
     def set_target_heading(self, heading):
         with self.lock:
@@ -297,7 +300,7 @@ def load_roi_config(path="roi_config.json"):
             "ignore_Top": 20,
             "Corner_LM": 0,
             "Corner_RM": 100,
-            "Wall_Top": 40,
+            "Wall_Top": 30,
             "Wall_Bottom": 70,
             "Right_Wall_RM": 100,
             "Right_Wall_LM": 70,
@@ -389,20 +392,17 @@ def gen_frames():
                     0.5, (255, 255, 255), 1)
         
         # Right column - Gyro data
-        right_x = w - 250
+        right_x = w - 280
         cv2.putText(frame, "GYRO ACTUAL", (right_x, info_y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-        cv2.putText(frame, f"Heading: {current_heading:.1f}°",
+        cv2.putText(frame, f"Cumulative: {gyro_data['cumulative']:.1f}°",
                     (right_x, info_y + line_height), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 0), 2)
-        cv2.putText(frame, f"Gyro X: {gyro_data['x']:.3f}",
+        cv2.putText(frame, f"Heading: {current_heading:.1f}°",
                     (right_x, info_y + line_height * 2), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1)
-        cv2.putText(frame, f"Gyro Y: {gyro_data['y']:.3f}",
-                    (right_x, info_y + line_height * 3), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, (255, 255, 255), 1)
+                    0.5, (200, 200, 200), 1)
         cv2.putText(frame, f"Gyro Z: {gyro_data['z']:.3f}",
-                    (right_x, info_y + line_height * 4), cv2.FONT_HERSHEY_SIMPLEX,
+                    (right_x, info_y + line_height * 3), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (255, 255, 255), 1)
         
         # Bottom - Motor status
@@ -419,8 +419,9 @@ def gen_frames():
         # Draw compass circle
         cv2.circle(frame, (center_x, indicator_y), 60, (100, 100, 100), 2)
         
-        # Draw target heading (cyan arrow)
-        arrow_angle_rad = target_angle * 3.14159 / 180
+        # Draw target heading (cyan arrow) - based on cumulative rotation
+        target_normalized = target_angle % 360
+        arrow_angle_rad = target_normalized * 3.14159 / 180
         end_x = int(center_x + arrow_length * np.sin(arrow_angle_rad))
         end_y = int(indicator_y - arrow_length * np.cos(arrow_angle_rad))
         cv2.arrowedLine(frame, (center_x, indicator_y), (end_x, end_y), 
@@ -428,7 +429,7 @@ def gen_frames():
         cv2.putText(frame, "T", (end_x + 5, end_y + 5), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
-        # Draw current heading (yellow arrow)
+        # Draw current heading (yellow arrow) - normalized display
         current_angle_rad = current_heading * 3.14159 / 180
         end_x2 = int(center_x + (arrow_length - 5) * np.sin(current_angle_rad))
         end_y2 = int(indicator_y - (arrow_length - 5) * np.cos(current_angle_rad))
@@ -499,14 +500,14 @@ HTML_PAGE = """
                             <div class="w-4 h-4 bg-cyan-400 mr-2"></div>
                             <span class="text-sm font-semibold">Target (T)</span>
                         </div>
-                        <p class="text-xs text-gray-400">Vision calculated heading</p>
+                        <p class="text-xs text-gray-400">Vision calculated (cumulative)</p>
                     </div>
                     <div>
                         <div class="flex items-center mb-2">
                             <div class="w-4 h-4 bg-yellow-400 mr-2"></div>
                             <span class="text-sm font-semibold">Actual (A)</span>
                         </div>
-                        <p class="text-xs text-gray-400">Gyroscope measured heading</p>
+                        <p class="text-xs text-gray-400">Gyro measured (normalized)</p>
                     </div>
                 </div>
             </div>
@@ -610,8 +611,9 @@ HTML_PAGE = """
                     <div class="text-xs text-gray-500 space-y-1">
                         <p>• PID: Kp=0.8, Ki=0.01, Kd=0.3</p>
                         <p>• Update Rate: 50Hz (20ms)</p>
-                        <p>• Servo Range: ±40°</p>
+                        <p>• Servo Range: ±30°</p>
                         <p>• Camera: 640×480 @ 30fps</p>
+                        <p>• Rotation: Cumulative (unlimited)</p>
                     </div>
                 </div>
             </div>
@@ -639,8 +641,8 @@ HTML_PAGE = """
                 </h3>
                 <div class="text-sm text-gray-300 space-y-2">
                     <p>• MPU6050 sensor</p>
-                    <p>• Tracks actual heading</p>
-                    <p>• Real-time orientation</p>
+                    <p>• Tracks cumulative rotation</p>
+                    <p>• Can exceed ±180° (e.g. 540°)</p>
                     <p>• 50Hz update rate</p>
                 </div>
             </div>
@@ -849,6 +851,7 @@ def get_status():
         'current_speed': gyro_steering.current_speed,
         'target_heading': vision_steering.get_target_angle(),
         'current_heading': gyro_data['heading'],
+        'cumulative_rotation': gyro_data['cumulative'],
         'gyro_x': gyro_data['x'],
         'gyro_y': gyro_data['y'],
         'gyro_z': gyro_data['z'],
