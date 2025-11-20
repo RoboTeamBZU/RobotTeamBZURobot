@@ -21,11 +21,11 @@ SERVO_PIN = 18
 IN1, IN2, ENA = 24, 23, 13
 
 # Servo limits
-SERVO_MAX_RIGHT = 40
-SERVO_MAX_LEFT = -40
+SERVO_MAX_RIGHT = 25
+SERVO_MAX_LEFT = -25
 
 # Motor settings
-DEFAULT_MOTOR_SPEED = 180
+DEFAULT_MOTOR_SPEED = 220
 
 # PID Controller parameters
 KP = 0.8
