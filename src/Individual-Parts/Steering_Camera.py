@@ -25,10 +25,10 @@ SERVO_MAX_RIGHT = 40
 SERVO_MAX_LEFT = -40
 
 # Motor settings
-DEFAULT_MOTOR_SPEED = 180
+DEFAULT_MOTOR_SPEED = 150
 
 # PID Controller parameters
-KP = 0.8
+KP = 0.1
 KI = 0.01
 KD = 0.3
 
@@ -51,8 +51,8 @@ time.sleep(2)
 class VisionSteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
-        self.max_rate = 5.0      # Maximum degrees per frame to change
-        self.deadzone = 50       # Ignore small differences (noise reduction)
+        self.max_rate = 1.0      # Maximum degrees per frame to change
+        self.deadzone = 1000       # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle
         self.lock = threading.Lock()
         
@@ -297,7 +297,7 @@ def load_roi_config(path="roi_config.json"):
             "ignore_Top": 20,
             "Corner_LM": 0,
             "Corner_RM": 100,
-            "Wall_Top": 30,
+            "Wall_Top": 40,
             "Wall_Bottom": 70,
             "Right_Wall_RM": 100,
             "Right_Wall_LM": 70,
