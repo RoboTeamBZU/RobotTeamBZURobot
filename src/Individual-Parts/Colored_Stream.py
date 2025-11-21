@@ -393,7 +393,7 @@ RED_LOW = (159, 196, 64)      # Red block lower HSV bound
 RED_HIGH = (188, 255, 142)    # Red block upper HSV bound
 
 GREEN_LOW = (37, 139, 45)     # Green block lower HSV bound
-GREEN_HIGH = (68, 252, 96)  # Green block upper HSV bound
+GREEN_HIGH = (80, 255, 142)  # Green block upper HSV bound
 
 # -----------------------------
 # Video Stream Generator
