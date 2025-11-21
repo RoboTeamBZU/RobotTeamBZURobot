@@ -52,17 +52,26 @@ class VisionSteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
         self.max_rate = 2.0      # Maximum degrees per frame to change
-        self.deadzone = 1000       # Ignore small differences (noise reduction)
+        self.deadzone = 1000     # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle
         self.lock = threading.Lock()
+        self.is_active = False   # Only accumulate when active
+        self.lap_limit = 1080.0  # Stop after 3 laps (3 × 360°)
+        self.lap_min = 1070.0    # Minimum threshold
+        self.lap_max = 1090.0    # Maximum threshold
         
     def update(self, left_pixels, right_pixels):
         """
         Update target angle based on wall pixel difference
         More left pixels = turn right (increase angle)
         More right pixels = turn left (decrease angle)
+        Only updates if active (after START clicked)
         """
         with self.lock:
+            if not self.is_active:
+                # Don't update target angle until started
+                return self.target_angle, 0.0, 0
+            
             difference = left_pixels - right_pixels
             
             # Apply deadzone to ignore small differences
@@ -84,10 +93,26 @@ class VisionSteeringController:
         with self.lock:
             return self.target_angle
     
+    def should_stop(self, current_rotation):
+        """Check if robot should stop based on lap completion"""
+        with self.lock:
+            return self.is_active and (self.lap_min <= abs(current_rotation) <= self.lap_max)
+    
+    def start(self):
+        """Activate vision steering"""
+        with self.lock:
+            self.is_active = True
+    
+    def stop(self):
+        """Deactivate vision steering"""
+        with self.lock:
+            self.is_active = False
+    
     def reset(self):
         """Reset to initial heading"""
         with self.lock:
             self.target_angle = 0.0
+            self.is_active = False
     
     def set_angle(self, angle):
         """Manually set target angle"""
@@ -105,6 +130,13 @@ class VisionSteeringController:
     def set_deadzone(self, value):
         with self.lock:
             self.deadzone = value
+    
+    def set_lap_limit(self, degrees):
+        """Set the rotation limit for auto-stop"""
+        with self.lock:
+            self.lap_limit = degrees
+            self.lap_min = degrees - 10
+            self.lap_max = degrees + 10
 
 # -----------------------------
 # Gyroscope Steering Controller (Hardware control)
@@ -261,6 +293,17 @@ class GyroSteeringController:
             # Update current heading from gyro
             self.update_heading()
             
+            # Check if we should auto-stop after completing laps
+            # Check GYRO cumulative rotation, not vision target
+            with self.lock:
+                current_rotation = self.cumulative_rotation
+            
+            if vision_controller.should_stop(current_rotation):
+                print(f"\n🏁 3 laps completed! Gyro cumulative rotation: {current_rotation:.1f}°")
+                self.stop_continuous_steering()
+                vision_controller.stop()
+                break
+            
             # Get target heading from vision controller
             target = vision_controller.get_target_angle()
             self.set_target_heading(target)
@@ -300,8 +343,7 @@ def load_roi_config(path="roi_config.json"):
             "ignore_Top": 20,
             "Corner_LM": 0,
             "Corner_RM": 100,
-            "Right_Wall_Top": 40,
-            "Left_Wall_Top": 30,
+            "Wall_Top": 30,
             "Wall_Bottom": 70,
             "Right_Wall_RM": 100,
             "Right_Wall_LM": 70,
@@ -329,8 +371,7 @@ def gen_frames():
         # ---- ROI pixel boundaries ----
         Ct = int(h * zones["Corner_Top"] / 100)
         Cb = int(h * zones["Corner_Bottom"] / 100)
-        RWt = int(h * zones["Right_Wall_Top"] / 100)
-        LWt = int(h * zones["Left_Wall_Top"] / 100)
+        Wt = int(h * zones["Wall_Top"] / 100)
         Wb = int(h * zones["Wall_Bottom"] / 100)
 
         Clm = int(w * zones["Corner_LM"] / 100)
@@ -345,8 +386,8 @@ def gen_frames():
 
         # Extract ROIs
         corner_roi = mask[Ct:Cb, Clm:Crm]
-        left_roi   = mask[LWt:Wb, Llm:Lrm]
-        right_roi  = mask[RWt:Wb, Rlm:Rrm]
+        left_roi   = mask[Wt:Wb, Llm:Lrm]
+        right_roi  = mask[Wt:Wb, Rlm:Rrm]
 
         # Count pixels
         corner_pixels = cv2.countNonZero(corner_roi)
@@ -360,8 +401,8 @@ def gen_frames():
 
         # ---------------- DRAW ROI boxes ------------------------
         cv2.rectangle(frame, (Clm, Ct), (Crm, Cb), (0, 255, 0), 2)      # Corner
-        cv2.rectangle(frame, (Llm, LWt), (Lrm, Wb), (255, 0, 0), 2)      # Left
-        cv2.rectangle(frame, (Rlm, RWt), (Rrm, Wb), (0, 0, 255), 2)      # Right
+        cv2.rectangle(frame, (Llm, Wt), (Lrm, Wb), (255, 0, 0), 2)      # Left
+        cv2.rectangle(frame, (Rlm, Wt), (Rrm, Wb), (0, 0, 255), 2)      # Right
 
         # ---- Draw pixel count text on each ROI ----
         cv2.putText(frame, f"C:{corner_pixels}",
@@ -369,11 +410,11 @@ def gen_frames():
                     0.5, (0,255,0), 2)
 
         cv2.putText(frame, f"L:{left_pixels}",
-                    (Llm, LWt - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    (Llm, Wt - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (255,0,0), 2)
 
         cv2.putText(frame, f"R:{right_pixels}",
-                    (Rlm, RWt - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    (Rlm, Wt - 10), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (0,0,255), 2)
 
         # ------------------- Display Steering Info -------------------
@@ -407,11 +448,42 @@ def gen_frames():
                     (right_x, info_y + line_height * 3), cv2.FONT_HERSHEY_SIMPLEX,
                     0.5, (255, 255, 255), 1)
         
-        # Bottom - Motor status
+        # Bottom - Motor status and lap progress
         bottom_y = h - 80
-        cv2.putText(frame, f"Motor: {gyro_steering.current_speed}/255 | Servo: {gyro_steering.current_servo_angle:.1f}°",
+        
+        # Calculate lap progress
+        laps_completed = abs(gyro_data['cumulative']) / 360.0
+        lap_percentage = (abs(gyro_data['cumulative']) / 1080.0) * 100.0
+        lap_percentage = min(lap_percentage, 100.0)
+        
+        cv2.putText(frame, f"Motor: {gyro_steering.current_speed}/255 | Servo: {gyro_steering.current_servo_angle:.1f}° | Laps: {laps_completed:.2f}/3",
                     (10, bottom_y), cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (255, 255, 255), 2)
+        
+        # Lap progress bar
+        bar_width = 300
+        bar_height = 20
+        bar_x = 10
+        bar_y = bottom_y + 10
+        
+        # Background bar
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+        
+        # Progress bar (changes color as it fills)
+        progress_width = int(bar_width * (lap_percentage / 100.0))
+        if lap_percentage < 33:
+            color = (0, 255, 0)  # Green for first lap
+        elif lap_percentage < 66:
+            color = (0, 255, 255)  # Yellow for second lap
+        else:
+            color = (0, 165, 255)  # Orange for third lap
+        
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), color, -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 2)
+        
+        # Progress text
+        cv2.putText(frame, f"{lap_percentage:.1f}%", (bar_x + bar_width + 10, bar_y + 15), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         
         # Visual indicator of target and current heading
         center_x = w // 2
@@ -538,9 +610,9 @@ HTML_PAGE = """
                     <div class="mt-5 pt-4 border-t border-gray-700">
                         <div class="flex justify-between mb-2">
                             <span class="text-gray-300 font-semibold">Motor Speed</span>
-                            <span class="text-white font-bold text-lg" id="speed-value">180</span>
+                            <span class="text-white font-bold text-lg" id="speed-value">220</span>
                         </div>
-                        <input type="range" id="speed-slider" min="100" max="255" value="180" 
+                        <input type="range" id="speed-slider" min="100" max="255" value="220" 
                                class="w-full h-3 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-green-500"
                                oninput="updateSpeedDisplay(this.value)">
                         <div class="flex justify-between text-xs text-gray-500 mt-1">
@@ -571,9 +643,9 @@ HTML_PAGE = """
                         <div>
                             <div class="flex justify-between mb-1">
                                 <span class="text-gray-400">Max Rate (°/frame)</span>
-                                <span class="text-white font-mono" id="rate-value">5.0</span>
+                                <span class="text-white font-mono" id="rate-value">2.0</span>
                             </div>
-                            <input type="range" id="rate-slider" min="1" max="200" value="50" 
+                            <input type="range" id="rate-slider" min="1" max="200" value="20" 
                                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                                    oninput="updateRateDisplay(this.value)" onchange="updateRate(this.value)">
                             <div class="text-xs text-gray-500 mt-1">Maximum turn rate limit</div>
@@ -582,9 +654,9 @@ HTML_PAGE = """
                         <div>
                             <div class="flex justify-between mb-1">
                                 <span class="text-gray-400">Deadzone (pixels)</span>
-                                <span class="text-white font-mono" id="dead-value">50</span>
+                                <span class="text-white font-mono" id="dead-value">1000</span>
                             </div>
-                            <input type="range" id="dead-slider" min="0" max="200" value="50" 
+                            <input type="range" id="dead-slider" min="0" max="2000" value="1000" 
                                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                                    oninput="updateDeadDisplay(this.value)" onchange="updateDead(this.value)">
                             <div class="text-xs text-gray-500 mt-1">Ignore small wall differences</div>
@@ -605,6 +677,20 @@ HTML_PAGE = """
                             Reset Target to 0°
                         </button>
                     </div>
+                    
+                    <div class="mt-4">
+                        <div class="flex justify-between mb-1">
+                            <span class="text-gray-400 text-sm">Lap Limit (°)</span>
+                            <span class="text-white font-mono text-sm" id="lap-value">1080</span>
+                        </div>
+                        <input type="range" id="lap-slider" min="360" max="3600" step="360" value="1080" 
+                               class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-yellow-500"
+                               oninput="updateLapDisplay(this.value)" onchange="updateLapLimit(this.value)">
+                        <div class="flex justify-between text-xs text-gray-500 mt-1">
+                            <span>1 lap</span>
+                            <span>10 laps</span>
+                        </div>
+                    </div>
                 </div>
                 
                 <!-- System Info -->
@@ -613,9 +699,10 @@ HTML_PAGE = """
                     <div class="text-xs text-gray-500 space-y-1">
                         <p>• PID: Kp=0.8, Ki=0.01, Kd=0.3</p>
                         <p>• Update Rate: 50Hz (20ms)</p>
-                        <p>• Servo Range: ±30°</p>
+                        <p>• Servo Range: ±25°</p>
                         <p>• Camera: 640×480 @ 30fps</p>
                         <p>• Rotation: Cumulative (unlimited)</p>
+                        <p>• Auto-stop: 3 laps (1070-1090°)</p>
                     </div>
                 </div>
             </div>
@@ -687,6 +774,11 @@ function updateDeadDisplay(value) {
     document.getElementById('dead-value').textContent = value;
 }
 
+function updateLapDisplay(value) {
+    const laps = value / 360;
+    document.getElementById('lap-value').textContent = value + ' (' + laps + ' laps)';
+}
+
 // API call functions (send to backend)
 function updateK(value) {
     const k = value / 1000;
@@ -718,6 +810,19 @@ function updateDead(value) {
     })
     .then(response => response.json())
     .then(data => console.log('Updated deadzone:', data));
+}
+
+function updateLapLimit(value) {
+    fetch('/update_param', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({param: 'lap_limit', value: parseInt(value)})
+    })
+    .then(response => response.json())
+    .then(data => {
+        console.log('Updated lap_limit:', data);
+        showNotification('Lap limit set to ' + (value/360) + ' laps', 'info');
+    });
 }
 
 function startSteering() {
@@ -807,6 +912,9 @@ def start_steering():
     speed = data.get('speed', DEFAULT_MOTOR_SPEED)
     
     if not gyro_steering.running:
+        # Activate vision steering to start accumulating target angle
+        vision_steering.start()
+        
         gyro_steering.start_continuous_steering(speed)
         steering_thread = threading.Thread(
             target=gyro_steering.steering_loop, 
@@ -820,6 +928,8 @@ def start_steering():
 
 @app.route('/stop_steering', methods=['POST'])
 def stop_steering():
+    # Stop vision steering from accumulating
+    vision_steering.stop()
     gyro_steering.stop_continuous_steering()
     return jsonify({'status': 'stopped'})
 
@@ -840,6 +950,8 @@ def update_param():
         vision_steering.set_max_rate(value)
     elif param == 'deadzone':
         vision_steering.set_deadzone(value)
+    elif param == 'lap_limit':
+        vision_steering.set_lap_limit(value)
     
     return jsonify({'status': 'ok', 'param': param, 'value': value})
 
@@ -874,8 +986,11 @@ if __name__ == "__main__":
         print(f"  • Integral gain (k): {vision_steering.k_integral}")
         print(f"  • Max rate: {vision_steering.max_rate}°/frame")
         print(f"  • Deadzone: {vision_steering.deadzone} pixels")
+        print(f"  • Vision active: {vision_steering.is_active} (starts on START button)")
         print("\nPID Parameters:")
         print(f"  • KP: {KP}, KI: {KI}, KD: {KD}")
+        print(f"  • Servo range: {SERVO_MAX_LEFT}° to {SERVO_MAX_RIGHT}°")
+        print(f"  • Motor speed: {DEFAULT_MOTOR_SPEED}")
         print("\nStarting server on http://0.0.0.0:5000")
         print("=" * 60)
         app.run(host='0.0.0.0', port=5000, threaded=True)
@@ -884,4 +999,3 @@ if __name__ == "__main__":
     finally:
         gyro_steering.cleanup()
         print("Cleanup complete")
-
