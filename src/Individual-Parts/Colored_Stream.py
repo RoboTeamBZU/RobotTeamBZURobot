@@ -373,11 +373,8 @@ def load_roi_config(path="roi_config.json"):
             "Corner_Top": 20,
             "Corner_Bottom": 40,
             "ignore_Top": 20,
-            # Split corner into left and right obstacle detection zones
-            "Left_Obstacle_LM": 0,
-            "Left_Obstacle_RM": 50,  # Left half for green detection
-            "Right_Obstacle_LM": 50,  # Right half for red detection
-            "Right_Obstacle_RM": 100,
+            "Corner_LM": 0,
+            "Corner_RM": 100,
             "Right_Wall_Top": 30,
             "Left_Wall_Top": 30,
             "Wall_Bottom": 70,
@@ -391,12 +388,12 @@ def load_roi_config(path="roi_config.json"):
 COLOR_LOW  = (0, 0, 0)      # lower HSV bound (black walls)
 COLOR_HIGH = (180, 255, 60)  # upper HSV bound
 
-# Color detection for obstacles - YOUR VALUES
+# Color detection for obstacles (adjust these to match your blocks)
 RED_LOW = (159, 196, 64)      # Red block lower HSV bound
 RED_HIGH = (188, 255, 142)    # Red block upper HSV bound
 
 GREEN_LOW = (37, 139, 45)     # Green block lower HSV bound
-GREEN_HIGH = (80, 255, 142)   # Green block upper HSV bound
+GREEN_HIGH = (80, 255, 142)  # Green block upper HSV bound
 
 # -----------------------------
 # Video Stream Generator
@@ -418,13 +415,8 @@ def gen_frames():
         LWt = int(h * zones["Left_Wall_Top"] / 100)
         Wb = int(h * zones["Wall_Bottom"] / 100)
 
-        # Obstacle detection ROIs (split left/right)
-        LOlm = int(w * zones["Left_Obstacle_LM"] / 100)
-        LOrm = int(w * zones["Left_Obstacle_RM"] / 100)
-        ROlm = int(w * zones["Right_Obstacle_LM"] / 100)
-        ROrm = int(w * zones["Right_Obstacle_RM"] / 100)
-        
-        # Wall detection ROIs
+        Clm = int(w * zones["Corner_LM"] / 100)
+        Crm = int(w * zones["Corner_RM"] / 100)
         Rlm = int(w * zones["Right_Wall_LM"] / 100)
         Rrm = int(w * zones["Right_Wall_RM"] / 100)
         Llm = int(w * zones["Left_Wall_LM"] / 100)
@@ -434,35 +426,35 @@ def gen_frames():
         wall_mask = cv2.inRange(hsv, COLOR_LOW, COLOR_HIGH)
 
         # Extract ROIs for walls
+        corner_roi = wall_mask[Ct:Cb, Clm:Crm]
         left_roi   = wall_mask[LWt:Wb, Llm:Lrm]
         right_roi  = wall_mask[RWt:Wb, Rlm:Rrm]
 
         # Count wall pixels
+        corner_pixels = cv2.countNonZero(corner_roi)
         left_pixels   = cv2.countNonZero(left_roi)
         right_pixels  = cv2.countNonZero(right_roi)
 
-        # ------------------- Obstacle Detection (Split ROIs) ---------------------
-        # Create color masks
+        # ------------------- Obstacle Detection ---------------------
+        # Detect red blocks in corner ROI
         red_mask = cv2.inRange(hsv, RED_LOW, RED_HIGH)
-        green_mask = cv2.inRange(hsv, GREEN_LOW, GREEN_HIGH)
-        
-        # Detect RED blocks in RIGHT obstacle ROI only
-        red_roi = red_mask[Ct:Cb, ROlm:ROrm]  # Right side only
+        red_roi = red_mask[Ct:Cb, Clm:Crm]
         red_pixels = cv2.countNonZero(red_roi)
 
-        # Detect GREEN blocks in LEFT obstacle ROI only
-        green_roi = green_mask[Ct:Cb, LOlm:LOrm]  # Left side only
+        # Detect green blocks in corner ROI
+        green_mask = cv2.inRange(hsv, GREEN_LOW, GREEN_HIGH)
+        green_roi = green_mask[Ct:Cb, Clm:Crm]
         green_pixels = cv2.countNonZero(green_roi)
 
         # Calculate avoidance bias
         avoidance_bias = 0.0
         
         if red_pixels > AVOIDANCE_THRESHOLD:
-            # Red detected on RIGHT: steer RIGHT (positive angle)
+            # Red detected: steer RIGHT (positive angle)
             avoidance_bias += red_pixels * AVOIDANCE_WEIGHT
         
         if green_pixels > AVOIDANCE_THRESHOLD:
-            # Green detected on LEFT: steer LEFT (negative angle)
+            # Green detected: steer LEFT (negative angle)
             avoidance_bias -= green_pixels * AVOIDANCE_WEIGHT
         
         # Clamp avoidance to reasonable limits
@@ -478,31 +470,25 @@ def gen_frames():
         gyro_data = gyro_steering.get_gyro_data()
 
         # ---------------- DRAW ROI boxes ------------------------
-        # Determine colors for obstacle ROIs
-        red_border_color = (0, 0, 255) if red_pixels > AVOIDANCE_THRESHOLD else (100, 100, 100)
-        green_border_color = (0, 255, 0) if green_pixels > AVOIDANCE_THRESHOLD else (100, 100, 100)
+        # Color the corner ROI based on obstacle detection
+        if red_pixels > AVOIDANCE_THRESHOLD:
+            corner_color = (0, 0, 255)  # Red border
+            corner_thickness = 4
+        elif green_pixels > AVOIDANCE_THRESHOLD:
+            corner_color = (0, 255, 0)  # Green border
+            corner_thickness = 4
+        else:
+            corner_color = (128, 128, 128)  # Gray border (no obstacle)
+            corner_thickness = 2
         
-        red_thickness = 4 if red_pixels > AVOIDANCE_THRESHOLD else 2
-        green_thickness = 4 if green_pixels > AVOIDANCE_THRESHOLD else 2
-        
-        # Draw split obstacle detection ROIs
-        cv2.rectangle(frame, (LOlm, Ct), (LOrm, Cb), green_border_color, green_thickness)  # Left (green)
-        cv2.rectangle(frame, (ROlm, Ct), (ROrm, Cb), red_border_color, red_thickness)      # Right (red)
-        
-        # Draw wall detection ROIs
+        cv2.rectangle(frame, (Clm, Ct), (Crm, Cb), corner_color, corner_thickness)
         cv2.rectangle(frame, (Llm, LWt), (Lrm, Wb), (255, 0, 0), 2)      # Left wall
         cv2.rectangle(frame, (Rlm, RWt), (Rrm, Wb), (0, 0, 255), 2)      # Right wall
 
         # ---- Draw pixel count text on each ROI ----
-        # Green obstacle ROI (left)
-        cv2.putText(frame, f"G:{green_pixels}",
-                    (LOlm, Ct - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, green_border_color, 2)
-        
-        # Red obstacle ROI (right)
-        cv2.putText(frame, f"R:{red_pixels}",
-                    (ROlm, Ct - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5, red_border_color, 2)
+        cv2.putText(frame, f"W:{corner_pixels} R:{red_pixels} G:{green_pixels}",
+                    (Clm, Ct - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, corner_color, 2)
 
         cv2.putText(frame, f"L:{left_pixels}",
                     (Llm, LWt - 10), cv2.FONT_HERSHEY_SIMPLEX,
@@ -626,7 +612,9 @@ def gen_frames():
         status_text = "RUNNING" if gyro_steering.is_moving else "STOPPED"
         cv2.circle(frame, (w - 80, 30), 12, status_color, -1)
         cv2.putText(frame, status_text, (w - 150, 35), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+
+
 
         # Encode frame to JPEG
         ret, buffer = cv2.imencode(".jpg", frame)
@@ -654,7 +642,7 @@ HTML_PAGE = """
     <div class="max-w-6xl mx-auto">
         <h1 class="text-4xl font-bold text-indigo-400 mb-6 flex items-center">
             <i data-feather="compass" class="mr-3"></i>
-            PiVision - Split ROI Obstacle Avoidance
+            PiVision - Obstacle Avoidance Steering
         </h1>
         
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
@@ -666,42 +654,33 @@ HTML_PAGE = """
                          alt="Live camera feed">
                     <div class="absolute top-4 left-4 bg-black bg-opacity-80 text-white px-4 py-2 rounded-lg">
                         <div class="text-xs text-gray-300">Steering Mode</div>
-                        <div class="text-xl font-bold text-green-400">Split ROI Detection</div>
+                        <div class="text-xl font-bold text-green-400">Vision + Gyro + Avoidance</div>
                     </div>
                 </div>
                 
                 <!-- Legend -->
-                <div class="mt-4 bg-gray-800 p-4 rounded-lg">
-                    <div class="grid grid-cols-2 gap-4 mb-3">
-                        <div>
-                            <div class="flex items-center mb-2">
-                                <div class="w-4 h-4 bg-cyan-400 mr-2"></div>
-                                <span class="text-sm font-semibold">Target (T)</span>
-                            </div>
-                            <p class="text-xs text-gray-400">Vision calculated</p>
+                <div class="mt-4 bg-gray-800 p-4 rounded-lg grid grid-cols-3 gap-4">
+                    <div>
+                        <div class="flex items-center mb-2">
+                            <div class="w-4 h-4 bg-cyan-400 mr-2"></div>
+                            <span class="text-sm font-semibold">Target (T)</span>
                         </div>
-                        <div>
-                            <div class="flex items-center mb-2">
-                                <div class="w-4 h-4 bg-yellow-400 mr-2"></div>
-                                <span class="text-sm font-semibold">Actual (A)</span>
-                            </div>
-                            <p class="text-xs text-gray-400">Gyro measured</p>
-                        </div>
+                        <p class="text-xs text-gray-400">Vision calculated</p>
                     </div>
-                    <div class="border-t border-gray-700 pt-3">
-                        <div class="text-xs font-semibold text-gray-400 mb-2">Split Detection Zones:</div>
-                        <div class="grid grid-cols-2 gap-2 text-xs">
-                            <div class="bg-green-900 bg-opacity-30 p-2 rounded border border-green-700">
-                                <span class="text-green-400 font-semibold">🟢 LEFT ROI</span>
-                                <div class="text-gray-400 mt-1">Detects Green blocks</div>
-                                <div class="text-gray-500">→ Steers LEFT</div>
-                            </div>
-                            <div class="bg-red-900 bg-opacity-30 p-2 rounded border border-red-700">
-                                <span class="text-red-400 font-semibold">🔴 RIGHT ROI</span>
-                                <div class="text-gray-400 mt-1">Detects Red blocks</div>
-                                <div class="text-gray-500">→ Steers RIGHT</div>
-                            </div>
+                    <div>
+                        <div class="flex items-center mb-2">
+                            <div class="w-4 h-4 bg-yellow-400 mr-2"></div>
+                            <span class="text-sm font-semibold">Actual (A)</span>
                         </div>
+                        <p class="text-xs text-gray-400">Gyro measured</p>
+                    </div>
+                    <div>
+                        <div class="flex items-center mb-2">
+                            <div class="w-4 h-4 bg-red-500 mr-2"></div>
+                            <div class="w-4 h-4 bg-green-500 mr-2"></div>
+                            <span class="text-sm font-semibold">Obstacles</span>
+                        </div>
+                        <p class="text-xs text-gray-400">Red/Green blocks</p>
                     </div>
                 </div>
             </div>
@@ -770,6 +749,12 @@ HTML_PAGE = """
                                    oninput="updateAvoidThreshDisplay(this.value)" onchange="updateAvoidThresh(this.value)">
                             <div class="text-xs text-gray-500 mt-1">Minimum pixels to trigger</div>
                         </div>
+                        
+                        <div class="bg-gray-800 p-3 rounded border border-orange-600">
+                            <div class="text-xs text-gray-400 mb-1">Avoidance Rules:</div>
+                            <div class="text-xs text-red-400">🔴 Red → Steer RIGHT (+)</div>
+                            <div class="text-xs text-green-400">🟢 Green → Steer LEFT (−)</div>
+                        </div>
                     </div>
                 </div>
                 
@@ -794,9 +779,9 @@ HTML_PAGE = """
                         <div>
                             <div class="flex justify-between mb-1">
                                 <span class="text-gray-400">Max Rate (°/frame)</span>
-                                <span class="text-white font-mono" id="rate-value">4.0</span>
+                                <span class="text-white font-mono" id="rate-value">2.0</span>
                             </div>
-                            <input type="range" id="rate-slider" min="1" max="200" value="40" 
+                            <input type="range" id="rate-slider" min="1" max="200" value="20" 
                                    class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-cyan-500"
                                    oninput="updateRateDisplay(this.value)" onchange="updateRate(this.value)">
                             <div class="text-xs text-gray-500 mt-1">Maximum turn rate</div>
@@ -850,10 +835,10 @@ HTML_PAGE = """
                     <div class="text-xs text-gray-500 space-y-1">
                         <p>• PID: Kp=0.8, Ki=0.01, Kd=0.3</p>
                         <p>• Update Rate: 50Hz (20ms)</p>
-                        <p>• Servo Range: ±35°</p>
+                        <p>• Servo Range: ±25°</p>
                         <p>• Camera: 640×480 @ 30fps</p>
                         <p>• Avoidance: 3-frame smoothing</p>
-                        <p>• Split ROI: 50/50 left/right</p>
+                        <p>• Auto-stop: 3 laps default</p>
                     </div>
                 </div>
             </div>
@@ -877,12 +862,12 @@ HTML_PAGE = """
             <div class="bg-gradient-to-br from-orange-900 to-gray-800 p-5 rounded-lg border border-orange-700">
                 <h3 class="text-lg font-bold text-orange-300 mb-2 flex items-center">
                     <i data-feather="alert-circle" class="w-5 h-5 mr-2"></i>
-                    Split ROI Detection
+                    Obstacle Avoidance
                 </h3>
                 <div class="text-sm text-gray-300 space-y-2">
-                    <p>• Left ROI: Green only</p>
-                    <p>• Right ROI: Red only</p>
-                    <p>• Ignores passed obstacles</p>
+                    <p>• Detects red & green blocks</p>
+                    <p>• Red: pass on right side</p>
+                    <p>• Green: pass on left side</p>
                     <p>• Smoothed response</p>
                 </div>
             </div>
@@ -1035,7 +1020,7 @@ function startSteering() {
     .then(response => response.json())
     .then(data => {
         console.log('Started:', data);
-        showNotification('Steering Started with Split ROI!', 'success');
+        showNotification('Steering Started with Avoidance!', 'success');
     })
     .catch(error => {
         console.error('Error:', error);
@@ -1183,8 +1168,10 @@ def get_status():
 # -----------------------------
 if __name__ == "__main__":
     try:
+    
+
         print("=" * 60)
-        print("Integrated Vision + Gyroscope + Split ROI Avoidance")
+        print("Integrated Vision + Gyroscope + Obstacle Avoidance")
         print("=" * 60)
         print("\nHardware:")
         print(f"  • Servo: GPIO {SERVO_PIN}")
@@ -1204,13 +1191,10 @@ if __name__ == "__main__":
         print(f"  • KP: {KP}, KI: {KI}, KD: {KD}")
         print(f"  • Servo range: {SERVO_MAX_LEFT}° to {SERVO_MAX_RIGHT}°")
         print(f"  • Motor speed: {DEFAULT_MOTOR_SPEED}")
-        print("\nColor Detection (YOUR VALUES):")
+        print("\nColor Detection:")
         print(f"  • Red blocks: {RED_LOW} to {RED_HIGH}")
         print(f"  • Green blocks: {GREEN_LOW} to {GREEN_HIGH}")
         print(f"  • Walls: {COLOR_LOW} to {COLOR_HIGH}")
-        print("\nSplit ROI Configuration:")
-        print(f"  • Left ROI (0-50%): GREEN detection only")
-        print(f"  • Right ROI (50-100%): RED detection only")
         print("\nStarting server on http://0.0.0.0:5000")
         print("=" * 60)
         app.run(host='0.0.0.0', port=5000, threaded=True)
