@@ -56,7 +56,7 @@ time.sleep(2)
 class VisionSteeringController:
     def __init__(self):
         self.target_angle = 0.0  # Current target heading (accumulated)
-        self.max_rate = 2.0      # Maximum degrees per frame to change
+        self.max_rate = 4.0      # Maximum degrees per frame to change
         self.deadzone = 1000     # Ignore small differences (noise reduction)
         self.k_integral = 0.01   # How fast to accumulate angle
         self.lock = threading.Lock()
