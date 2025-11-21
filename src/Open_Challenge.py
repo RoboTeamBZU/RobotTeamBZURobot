@@ -1,686 +1,499 @@
 #!/usr/bin/env python3
+"""
+Autonomous Wall-Following Robot with Vision + Gyro Control
+Runs standalone with GPIO button (pin 25) - no Flask or internet required
+Press button to start 3-lap autonomous run
+"""
+
+from picamera2 import Picamera2
+import cv2
 import time
-import os
-import math
-import traceback
+import json
 import threading
+import numpy as np
+import math
 import board
-from digitalio import DigitalInOut
-from adafruit_vl53l0x import VL53L0X
 import adafruit_mpu6050
 import pigpio
 import RPi.GPIO as GPIO
 from gpiozero import AngularServo, Device
 from gpiozero.pins.pigpio import PiGPIOFactory
-from picamera2 import Picamera2
-import cv2
-import numpy as np
-from flask import Flask, Response, render_template_string
+from signal import pause
 
-# ============================================================================
-# CONFIG (DO NOT change GPIOs without telling me)
-# ============================================================================
-IN1, IN2, ENA = 24, 23, 13        # motor driver pins (unchanged)
-SERVO_PIN = 18                   # steering servo pin (unchanged)
-SWITCH_PIN = 25                  # start/stop switch (unchanged)
-LED_BLUE = 6
+# -----------------------------
+# Hardware Pin Configuration
+# -----------------------------
+SERVO_PIN = 18
+IN1, IN2, ENA = 24, 23, 13
+SWITCH_PIN = 25  # GPIO pin for physical on/off switch
 
-XSHUT_PINS = [board.D22, board.D27, board.D17, board.D26]  # Right, Left, Back, Front
-SENSOR_NAMES = ['Right', 'Left', 'Back', 'Front']
+# Servo limits
+SERVO_MAX_RIGHT = 35
+SERVO_MAX_LEFT = -35
 
-# Motion & steering
-SPEED = 200           # motor PWM (0-255). Reduce for initial testing.
-MAX_STEER = 40        # degrees clamp for servo
-DEAD_ZONE = 80        # mm difference considered centered
+# Motor settings
+DEFAULT_MOTOR_SPEED = 220
 
-# PD controller (tune during practice)
-PD_KP = 0.03
-PD_KD = 0.007
-PD_DT_MIN = 0.01
+# PID Controller parameters
+KP = 0.8
+KI = 0.01
+KD = 0.3
 
-# Corner detection thresholds (mm)
-FRONT_CLOSE = 180
-SIDE_OPEN = 600
-SIDE_CLOSE = 350
+# Direction settings
+SERVO_DIRECTION = 1
+GYRO_DIRECTION = -1
 
-# Turn parameters
-TURN_TARGET_DEG = 90
-TURN_TOLERANCE = 0.95
-TURN_TIMEOUT = 4.0  # seconds
+# Vision parameters
+K_INTEGRAL = 0.01
+MAX_RATE = 2.0
+DEADZONE = 1000
+LAP_LIMIT = 1080.0  # 3 laps
 
-# Camera
-CAM_W, CAM_H = 640, 480
-CAM_CAL_FILE = "camera_cal.npz"  # optional undistort file; create with calibration script
+# -----------------------------
+# Camera Setup
+# -----------------------------
+print("Initializing camera...")
+picam2 = Picamera2()
+preview_config = picam2.create_preview_configuration(main={"size": (640, 480)})
+picam2.configure(preview_config)
+picam2.start()
+time.sleep(2)
+print("✓ Camera ready")
 
-# Sensor timing
-SENSOR_SAMPLE_DELAY = 0.02
+# -----------------------------
+# GPIO Setup for Switch
+# -----------------------------
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+print(f"✓ Switch configured on GPIO {SWITCH_PIN}")
 
-# Gyro calibration
-GYRO_CAL_DURATION = 1.0
-
-# Flask streaming
-FLASK_PORT = 5000
-ENABLE_STREAM = True  # Set to False to disable streaming
-
-# ============================================================================
-# GLOBAL VARIABLES FOR STREAMING
-# ============================================================================
-latest_frame = None
-frame_lock = threading.Lock()
-stream_overlay_data = {}
-
-# ============================================================================
-# FLASK APP SETUP
-# ============================================================================
-app = Flask(__name__)
-
-HTML_PAGE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WRO Robot Debug Stream</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://unpkg.com/feather-icons"></script>
-</head>
-<body class="bg-gray-900 text-gray-100 min-h-screen">
-<main class="container mx-auto px-4 py-8">
-    <div class="max-w-6xl mx-auto">
-        <h1 class="text-3xl font-bold text-indigo-400 mb-4">🚗 WRO Robot Debug Stream</h1>
-        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- Video Feed -->
-            <div class="lg:col-span-2">
-                <div class="relative bg-gray-800 rounded-xl overflow-hidden shadow-2xl">
-                    <div class="aspect-video">
-                        <img id="video-feed" src="{{ url_for('video_feed') }}" 
-                             class="w-full h-full object-cover" 
-                             alt="Live camera feed">
-                    </div>
-                    <div class="absolute top-4 left-4 bg-black bg-opacity-70 text-white px-3 py-2 rounded-lg text-sm">
-                        <div class="flex items-center gap-2">
-                            <div class="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
-                            <span class="font-medium">LIVE</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
+# -----------------------------
+# Vision Steering Controller
+# -----------------------------
+class VisionSteeringController:
+    def __init__(self):
+        self.target_angle = 0.0
+        self.max_rate = MAX_RATE
+        self.deadzone = DEADZONE
+        self.k_integral = K_INTEGRAL
+        self.lock = threading.Lock()
+        self.is_active = False
+        self.lap_limit = LAP_LIMIT
+        self.lap_min = LAP_LIMIT - 10
+        self.lap_max = LAP_LIMIT + 10
+        
+    def update(self, left_pixels, right_pixels):
+        """Update target angle based on wall pixel difference"""
+        with self.lock:
+            if not self.is_active:
+                return self.target_angle, 0.0, 0
             
-            <!-- Sensor Data -->
-            <div class="space-y-4">
-                <div class="bg-gray-800 p-4 rounded-lg">
-                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">📡 TOF Sensors (mm)</h3>
-                    <div class="space-y-2">
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Front:</span>
-                            <span id="sensor-front" class="text-white font-mono text-lg">---</span>
-                        </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Left:</span>
-                            <span id="sensor-left" class="text-white font-mono text-lg">---</span>
-                        </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Right:</span>
-                            <span id="sensor-right" class="text-white font-mono text-lg">---</span>
-                        </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Back:</span>
-                            <span id="sensor-back" class="text-white font-mono text-lg">---</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="bg-gray-800 p-4 rounded-lg">
-                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">🎮 Control Status</h3>
-                    <div class="space-y-2">
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Steering:</span>
-                            <span id="steering" class="text-white font-mono">0°</span>
-                        </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Action:</span>
-                            <span id="action" class="text-green-400 font-medium">READY</span>
-                        </div>
-                        <div class="flex justify-between items-center">
-                            <span class="text-gray-400">Camera Error:</span>
-                            <span id="cam-error" class="text-white font-mono">---</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="bg-gray-800 p-4 rounded-lg">
-                    <h3 class="text-lg font-semibold text-indigo-300 mb-3">ℹ️ Info</h3>
-                    <div class="text-sm text-gray-400 space-y-1">
-                        <p>• Red overlay = Detected walls</p>
-                        <p>• Green line = Lane center</p>
-                        <p>• Blue line = Target center</p>
-                        <p>• Resolution: 640×480</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</main>
-<script>
-feather.replace();
-
-// Poll sensor data every 200ms
-setInterval(() => {
-    fetch('/sensor_data')
-        .then(res => res.json())
-        .then(data => {
-            document.getElementById('sensor-front').textContent = data.front || '---';
-            document.getElementById('sensor-left').textContent = data.left || '---';
-            document.getElementById('sensor-right').textContent = data.right || '---';
-            document.getElementById('sensor-back').textContent = data.back || '---';
-            document.getElementById('steering').textContent = data.steering || '0°';
-            document.getElementById('action').textContent = data.action || 'READY';
-            document.getElementById('cam-error').textContent = data.cam_error || '---';
-        })
-        .catch(err => console.error('Failed to fetch sensor data:', err));
-}, 200);
-</script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_PAGE)
-
-@app.route('/video_feed')
-def video_feed():
-    def gen_frames():
-        while True:
-            with frame_lock:
-                if latest_frame is not None:
-                    frame = latest_frame.copy()
-                else:
-                    time.sleep(0.05)
-                    continue
+            difference = left_pixels - right_pixels
             
-            # Encode to JPEG
-            ret, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ret:
-                continue
+            # Apply deadzone
+            if abs(difference) < self.deadzone:
+                difference = 0
             
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            # Calculate rate of change
+            rate = difference * self.k_integral
+            
+            # Clamp rate
+            rate = max(-self.max_rate, min(self.max_rate, rate))
+            
+            # Accumulate angle
+            self.target_angle += rate
+            
+            return self.target_angle, rate, difference
     
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    def get_target_angle(self):
+        with self.lock:
+            return self.target_angle
+    
+    def should_stop(self, current_rotation):
+        """Check if robot should stop based on lap completion"""
+        with self.lock:
+            return self.is_active and (self.lap_min <= abs(current_rotation) <= self.lap_max)
+    
+    def start(self):
+        with self.lock:
+            self.is_active = True
+            print("✓ Vision steering activated")
+    
+    def stop(self):
+        with self.lock:
+            self.is_active = False
+            print("✓ Vision steering deactivated")
+    
+    def reset(self):
+        with self.lock:
+            self.target_angle = 0.0
+            self.is_active = False
+            print("✓ Vision steering reset")
 
-@app.route('/sensor_data')
-def sensor_data():
-    return stream_overlay_data
-
-def start_flask_server():
-    """Start Flask server in a background thread."""
-    app.run(host='0.0.0.0', port=FLASK_PORT, threaded=True, debug=False, use_reloader=False)
-
-# ============================================================================
-# HARDWARE SETUP
-# ============================================================================
-def setup_sensors():
-    """Initialize VL53L0X sensors (XSHUT sequencing)."""
-    print("Setting up TOF sensors...")
-    i2c = board.I2C()
-    xshut = [DigitalInOut(pin) for pin in XSHUT_PINS]
-    for p in xshut:
-        p.switch_to_output(value=False)
-    time.sleep(0.1)
-
-    vl53 = []
-    for i, p in enumerate(xshut):
-        p.value = True
-        time.sleep(0.12)
-        try:
-            sensor = VL53L0X(i2c)
-            if i < len(xshut) - 1:
-                sensor.set_address(i + 0x30)
-            vl53.append(sensor)
-        except Exception as e:
-            print(f"⚠️  VL53 init failed for {SENSOR_NAMES[i]}: {e}")
-            vl53.append(None)
-    print("✓ TOF Sensors ready")
-    return vl53
-
-def setup_motor_servo():
-    """Initialize pigpio, motor pins, servo, switch and LED."""
-    pi = pigpio.pi()
-    if not pi.connected:
-        raise RuntimeError("pigpio daemon not running. Start with: sudo systemctl enable --now pigpiod")
-
-    for p in (IN1, IN2, ENA):
-        pi.set_mode(p, pigpio.OUTPUT)
-    pi.set_PWM_frequency(ENA, 2000)
-
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(LED_BLUE, GPIO.OUT)
-    GPIO.output(LED_BLUE, GPIO.LOW)
-
-    Device.pin_factory = PiGPIOFactory()
-    servo = AngularServo(SERVO_PIN, min_pulse_width=0.0006, max_pulse_width=0.0023)
-    servo.angle = 0
-
-    print("✓ Motor & servo ready")
-    return pi, servo
-
-def setup_mpu6050():
-    """Initialize MPU6050 (gyro)."""
-    try:
+# -----------------------------
+# Gyroscope Steering Controller
+# -----------------------------
+class GyroSteeringController:
+    def __init__(self):
+        # Initialize pigpio for motors
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            raise RuntimeError("pigpio daemon not running. Run 'sudo pigpiod' first")
+        
+        for p in (ENA, IN1, IN2):
+            self.pi.set_mode(p, pigpio.OUTPUT)
+        
+        self.pi.set_PWM_frequency(ENA, 2000)
+        
+        # Initialize servo
+        Device.pin_factory = PiGPIOFactory()
+        self.servo = AngularServo(
+            SERVO_PIN,
+            min_angle=SERVO_MAX_LEFT,
+            max_angle=SERVO_MAX_RIGHT,
+            min_pulse_width=0.0012,
+            max_pulse_width=0.0017
+        )
+        
+        # Initialize MPU6050
         i2c = board.I2C()
-        mpu = adafruit_mpu6050.MPU6050(i2c)
-        print("✓ MPU6050 ready")
-        return mpu
-    except Exception as e:
-        print(f"⚠️  MPU6050 not found: {e}")
-        return None
-
-# ============================================================================
-# MOTOR CONTROL
-# ============================================================================
-def run_motor(pi, speed):
-    """Run forward at given duty cycle (0-255)."""
-    pi.write(IN1, 1)
-    pi.write(IN2, 0)
-    pi.set_PWM_dutycycle(ENA, int(max(0, min(255, speed))))
-
-def stop_motor(pi):
-    pi.set_PWM_dutycycle(ENA, 0)
-    pi.write(IN1, 1)
-    pi.write(IN2, 1)
-
-# ============================================================================
-# SENSOR READS
-# ============================================================================
-def read_sensors(vl53):
-    """Read all 4 TOF sensors; clamp out-of-range to 1500 mm."""
-    distances = {}
-    for i, sensor in enumerate(vl53):
-        name = SENSOR_NAMES[i]
-        if sensor is None:
-            distances[name] = 1500
-            continue
-        try:
-            d = sensor.range
-            distances[name] = d if 10 <= d <= 1500 else 1500
-        except Exception:
-            distances[name] = 1500
-        time.sleep(SENSOR_SAMPLE_DELAY)
-    return distances
-
-# ============================================================================
-# PD CONTROLLER
-# ============================================================================
-class PDController:
-    def __init__(self, kp=PD_KP, kd=PD_KD):
-        self.kp = kp
-        self.kd = kd
+        self.mpu = adafruit_mpu6050.MPU6050(i2c)
+        
+        # State variables
+        self.current_heading = 0.0
+        self.cumulative_rotation = 0.0
+        self.target_heading = 0.0
+        self.last_time = time.time()
+        self.integral = 0.0
         self.last_error = 0.0
-        self.last_time = None
-
-    def update(self, error):
-        t = time.time()
-        if self.last_time is None:
-            dt = PD_DT_MIN
-        else:
-            dt = max(PD_DT_MIN, t - self.last_time)
-        d_error = (error - self.last_error) / dt
-        output = self.kp * error + self.kd * d_error
+        self.is_moving = False
+        self.current_speed = DEFAULT_MOTOR_SPEED
+        self.current_servo_angle = 0.0
+        self.running = False
+        self.lock = threading.Lock()
+        
+        # Calibrate gyro
+        self.calibrate_gyro()
+        
+    def calibrate_gyro(self, samples=100):
+        print("Calibrating gyroscope...")
+        gyro_z_offset = 0.0
+        for i in range(samples):
+            gyro_z_offset += self.mpu.gyro[2]
+            time.sleep(0.01)
+        self.gyro_z_offset = gyro_z_offset / samples
+        print(f"✓ Gyro calibrated. Offset: {self.gyro_z_offset:.4f}")
+    
+    def run_motor(self, speed):
+        forward = speed >= 0
+        self.pi.write(IN1, 1 if forward else 0)
+        self.pi.write(IN2, 0 if forward else 1)
+        speed_value = min(255, abs(int(speed)))
+        self.pi.set_PWM_dutycycle(ENA, speed_value)
+        self.is_moving = True
+        self.current_speed = speed_value
+        
+    def stop_motor(self):
+        self.pi.set_PWM_dutycycle(ENA, 0)
+        self.pi.write(IN1, 0)
+        self.pi.write(IN2, 0)
+        self.is_moving = False
+        self.current_speed = 0
+        
+    def update_heading(self):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        
+        # Read gyro data
+        gyro_data = self.mpu.gyro
+        gyro_z = gyro_data[2]
+        
+        gyro_z_corrected = (gyro_z - self.gyro_z_offset) * GYRO_DIRECTION
+        heading_change = math.degrees(gyro_z_corrected * dt)
+        
+        with self.lock:
+            self.cumulative_rotation += heading_change
+            self.current_heading = (self.current_heading + heading_change + 180) % 360 - 180
+        
+    def calculate_steering_angle(self, target_heading):
+        with self.lock:
+            error = target_heading - self.cumulative_rotation
+        
+        self.integral += error
+        self.integral = max(min(self.integral, 100), -100)
+        
+        derivative = error - self.last_error
         self.last_error = error
-        self.last_time = t
-        return output
-
-# ============================================================================
-# CAMERA (Picamera2) + OPTIONAL UNDISTORT
-# ============================================================================
-def init_camera():
-    print("Initializing camera...")
-    try:
-        picam2 = Picamera2()
-        camera_config = picam2.create_preview_configuration(main={"size": (CAM_W, CAM_H)})
-        picam2.configure(camera_config)
-        picam2.start()
-        time.sleep(0.5)  # Give camera time to warm up
         
-        remap = None
-        if os.path.exists(CAM_CAL_FILE):
+        steering = (KP * error + KI * self.integral + KD * derivative) * SERVO_DIRECTION
+        steering = max(min(steering, SERVO_MAX_RIGHT), SERVO_MAX_LEFT)
+        
+        return steering, error
+    
+    def get_cumulative_rotation(self):
+        with self.lock:
+            return self.cumulative_rotation
+    
+    def set_target_heading(self, heading):
+        with self.lock:
+            self.target_heading = heading
+        
+    def start_continuous_steering(self, speed=DEFAULT_MOTOR_SPEED):
+        """Start continuous steering mode"""
+        self.running = True
+        self.run_motor(speed)
+        print(f"✓ Motor started at speed {speed}")
+        
+    def stop_continuous_steering(self):
+        """Stop continuous steering mode"""
+        self.running = False
+        self.stop_motor()
+        self.servo.angle = 0
+        self.current_servo_angle = 0
+        print("✓ Motor stopped")
+        
+    def steering_loop(self, vision_controller, roi_zones):
+        """Main steering loop - runs continuously"""
+        print("🚀 Starting autonomous steering loop...")
+        self.last_time = time.time()
+        
+        while self.running:
             try:
-                data = np.load(CAM_CAL_FILE)
-                K = data['K']
-                D = data['D']
-                try:
-                    map1, map2 = cv2.fisheye.initUndistortRectifyMap(K, D, np.eye(3), K, (CAM_W, CAM_H), cv2.CV_16SC2)
-                except Exception:
-                    map1, map2 = cv2.initUndistortRectifyMap(K, D, None, K, (CAM_W, CAM_H), cv2.CV_16SC2)
-                remap = (map1, map2)
-                print("✓ Camera calibration loaded")
+                # Capture and process frame
+                frame = picam2.capture_array()
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                
+                h, w, _ = frame.shape
+                
+                # Calculate ROI boundaries
+                RWt = int(h * roi_zones["Right_Wall_Top"] / 100)
+                LWt = int(h * roi_zones["Left_Wall_Top"] / 100)
+                Wb = int(h * roi_zones["Wall_Bottom"] / 100)
+                Rlm = int(w * roi_zones["Right_Wall_LM"] / 100)
+                Rrm = int(w * roi_zones["Right_Wall_RM"] / 100)
+                Llm = int(w * roi_zones["Left_Wall_LM"] / 100)
+                Lrm = int(w * roi_zones["Left_Wall_RM"] / 100)
+                
+                # Create mask and count pixels
+                mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 60))
+                left_roi = mask[LWt:Wb, Llm:Lrm]
+                right_roi = mask[RWt:Wb, Rlm:Rrm]
+                
+                left_pixels = cv2.countNonZero(left_roi)
+                right_pixels = cv2.countNonZero(right_roi)
+                
+                # Update vision target
+                target_angle, rate, diff = vision_controller.update(left_pixels, right_pixels)
+                
+                # Update heading from gyro
+                self.update_heading()
+                
+                # Check if we should auto-stop
+                current_rotation = self.get_cumulative_rotation()
+                
+                if vision_controller.should_stop(current_rotation):
+                    laps = current_rotation / 360.0
+                    print(f"\n🏁 Mission Complete! {laps:.2f} laps ({current_rotation:.1f}°)")
+                    self.stop_continuous_steering()
+                    vision_controller.stop()
+                    break
+                
+                # Set target and calculate steering
+                self.set_target_heading(target_angle)
+                steering_angle, error = self.calculate_steering_angle(target_angle)
+                self.servo.angle = steering_angle
+                self.current_servo_angle = steering_angle
+                
+                # Print status every 50 frames (~1 second)
+                if int(current_rotation * 10) % 500 == 0:
+                    laps = abs(current_rotation) / 360.0
+                    print(f"Laps: {laps:.2f} | Target: {target_angle:.1f}° | "
+                          f"Actual: {current_rotation:.1f}° | Error: {error:.1f}° | "
+                          f"Servo: {steering_angle:.1f}° | L/R: {left_pixels}/{right_pixels}")
+                
+                time.sleep(0.02)  # 50Hz update rate
+                
             except Exception as e:
-                print(f"⚠️ Failed loading camera calibration: {e}")
-                traceback.print_exc()
-        print("✓ Camera ready (Picamera2)")
-        return picam2, remap
-    except Exception as e:
-        print(f"⚠️ Camera initialization failed: {e}")
-        print("  Robot will run using TOF sensors only")
-        traceback.print_exc()
-        return None, None
+                print(f"⚠ Error in steering loop: {e}")
+                self.stop_continuous_steering()
+                vision_controller.stop()
+                break
+                
+        print("✓ Steering loop ended")
+        
+    def cleanup(self):
+        self.stop_motor()
+        self.servo.angle = 0
+        self.servo.close()
+        self.pi.stop()
+        print("✓ Hardware cleanup complete")
 
-def camera_capture_frame(picam2, remap):
-    """
-    Capture a frame from Picamera2 and optionally apply undistortion.
-    Returns BGR frame or None on failure.
-    """
-    if picam2 is None:
-        return None
+# -----------------------------
+# ROI Configuration
+# -----------------------------
+def load_roi_config(path="roi_config.json"):
     try:
-        frame = picam2.capture_array()
-        # Convert RGB to BGR for OpenCV
-        if frame.shape[2] == 3:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        elif frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        with open(path, "r") as f:
+            cfg = json.load(f)
+        print("✓ Loaded ROI config from file")
+        return cfg["zones"]
+    except:
+        print("⚠ Using default ROI config")
+        return {
+            "Corner_Top": 20,
+            "Corner_Bottom": 40,
+            "ignore_Top": 20,
+            "Corner_LM": 0,
+            "Corner_RM": 100,
+            "Right_Wall_Top": 40,
+            "Left_Wall_Top": 30,
+            "Wall_Bottom": 70,
+            "Right_Wall_RM": 100,
+            "Right_Wall_LM": 70,
+            "Left_Wall_RM": 30,
+            "Left_Wall_LM": 0,
+        }
+
+# -----------------------------
+# Main Control Logic
+# -----------------------------
+class AutonomousRobot:
+    def __init__(self):
+        self.vision_controller = VisionSteeringController()
+        self.gyro_controller = GyroSteeringController()
+        self.roi_zones = load_roi_config()
+        self.steering_thread = None
+        self.is_running = False
+        self.mission_started = False  # Track if we've started this switch cycle
         
-        # Apply undistortion if calibration maps are available
-        if remap is not None:
-            map1, map2 = remap
-            frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
+        # Start switch monitor thread
+        self.monitor_thread = threading.Thread(target=self.monitor_switch, daemon=True)
+        self.monitor_thread.start()
         
-        return frame
-    except Exception as e:
-        return None
-
-# ============================================================================
-# SIMPLE WALL DETECTION (camera) + VISUALIZATION
-# ============================================================================
-def detect_walls_from_camera(frame, visualize=False):
-    """
-    Detect left & right wall contours in a horizontal ROI and return lateral error (px).
-    If visualize=True, draws detection overlays on the frame.
-    Returns (error_px, annotated_frame) or (None, frame)
-    """
-    if frame is None:
-        return None, frame
-    
-    h, w = frame.shape[:2]
-    y1 = int(h * 0.35)
-    y2 = int(h * 0.65)
-    roi = frame[y1:y2, :]
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5,5), 0)
-    clahe = cv2.createCLAHE(clipLimit=3.0)
-    enhanced = clahe.apply(blurred)
-    _, th = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    th = cv2.bitwise_not(th)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7,7))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, frame
-
-    min_area = (w * (y2-y1)) * 0.01
-    large = [c for c in contours if cv2.contourArea(c) > min_area]
-    if not large:
-        return None, frame
-
-    boxes = [cv2.boundingRect(c) for c in large]
-    boxes = sorted(boxes, key=lambda b: b[0])
-    left_box = boxes[0]
-    right_box = boxes[-1] if len(boxes) > 1 else None
-
-    left_cx = left_box[0] + left_box[2] // 2
-    
-    if visualize:
-        # Draw ROI boundaries
-        cv2.rectangle(frame, (0, y1), (w, y2), (255, 255, 0), 2)
+        print("\n" + "="*60)
+        print("🤖 AUTONOMOUS WALL-FOLLOWING ROBOT")
+        print("="*60)
+        print(f"Switch: GPIO {SWITCH_PIN} (Physical ON/OFF switch)")
+        print(f"  • Switch ON (HIGH/1) = Start mission")
+        print(f"  • Switch OFF (LOW/0) = Stop mission")
+        print(f"Servo: GPIO {SERVO_PIN} (Range: {SERVO_MAX_LEFT}° to {SERVO_MAX_RIGHT}°)")
+        print(f"Motor: IN1={IN1}, IN2={IN2}, ENA={ENA} (Speed: {DEFAULT_MOTOR_SPEED})")
+        print(f"Mission: Complete 3 laps ({LAP_LIMIT}° rotation)")
+        print("\n✅ Ready! Toggle switch to ON position to start")
+        print("="*60 + "\n")
         
-        # Draw detected wall boxes
-        cv2.rectangle(frame, 
-                      (left_box[0], y1 + left_box[1]), 
-                      (left_box[0] + left_box[2], y1 + left_box[1] + left_box[3]),
-                      (0, 0, 255), 2)
+    def monitor_switch(self):
+        """Continuously monitor physical switch state using direct GPIO"""
+        print("✓ Switch monitor thread started")
+        last_state = None
         
-        if right_box is not None:
-            cv2.rectangle(frame, 
-                          (right_box[0], y1 + right_box[1]), 
-                          (right_box[0] + right_box[2], y1 + right_box[1] + right_box[3]),
-                          (0, 0, 255), 2)
-    
-    if right_box is not None:
-        right_cx = right_box[0] + right_box[2] // 2
-        lane_center_px = (left_cx + right_cx) / 2.0
-        error_px = lane_center_px - (w / 2.0)
-        
-        if visualize:
-            # Draw lane center (green) and target center (blue)
-            cv2.line(frame, (int(lane_center_px), 0), (int(lane_center_px), h), (0, 255, 0), 2)
-            cv2.line(frame, (w//2, 0), (w//2, h), (255, 0, 0), 2)
-            cv2.putText(frame, f"Error: {error_px:.1f}px", (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
-        return error_px, frame
-    else:
-        return None, frame
-
-# ============================================================================
-# CORNER DETECTION & TURNING (gyro)
-# ============================================================================
-def detect_corner(distances):
-    """Use front & side TOFs to decide whether a 90° turn is required."""
-    r, l, f = distances['Right'], distances['Left'], distances['Front']
-    if f < FRONT_CLOSE:
-        if l > SIDE_OPEN and r < SIDE_CLOSE:
-            return 'left'
-        elif r > SIDE_OPEN and l < SIDE_CLOSE:
-            return 'right'
-    return None
-
-def calibrate_gyro(mpu, duration=GYRO_CAL_DURATION):
-    """Average gyro z readings for duration seconds to compute bias."""
-    if not mpu:
-        return 0.0
-    print(f"Calibrating gyro for {duration:.1f}s. Keep robot still.")
-    t_end = time.time() + duration
-    samples = []
-    while time.time() < t_end:
-        try:
-            samples.append(mpu.gyro[2])
-        except Exception:
-            pass
-        time.sleep(0.01)
-    bias = float(np.mean(samples)) if samples else 0.0
-    print(f"✓ Gyro bias (rad/s): {bias:.6f}  (~{bias*57.2958:.3f} °/s)")
-    return bias
-
-def turn_90(pi, servo, mpu, bias_z, direction, speed=SPEED):
-    """Perform ~90° turn by integrating gyro z; with timeout and bias compensation."""
-    if not mpu:
-        print("⚠️ No MPU - cannot perform gyro turn")
-        return False
-    print(f"\n🔄 Turning {direction.upper()} {TURN_TARGET_DEG}° ...")
-    servo.angle = -MAX_STEER if direction == 'left' else MAX_STEER
-    target = -TURN_TARGET_DEG if direction == 'left' else TURN_TARGET_DEG
-
-    run_motor(pi, speed)
-    last_t = time.time()
-    start_t = last_t
-    rotation = 0.0
-    while abs(rotation) < abs(target) * TURN_TOLERANCE:
-        if time.time() - start_t > TURN_TIMEOUT:
-            print("\n⚠️ Turn timeout - stopping.")
-            stop_motor(pi)
-            servo.angle = 0
-            return False
-        try:
-            gz = mpu.gyro[2]
-            yaw_rate = (gz - bias_z) * 57.2958  # deg/s
-        except Exception:
-            yaw_rate = 0.0
-        now = time.time()
-        dt = now - last_t
-        last_t = now
-        rotation += yaw_rate * dt
-        time.sleep(0.01)
-    stop_motor(pi)
-    servo.angle = 0
-    time.sleep(0.2)
-    print(f"✓ Turn done: {rotation:.1f}°")
-    return True
-
-# ============================================================================
-# UTILITY
-# ============================================================================
-def apply_steering(servo, angle):
-    """Safe servo set with clamp."""
-    servo.angle = max(-MAX_STEER, min(MAX_STEER, angle))
-
-# ============================================================================
-# MAIN
-# ============================================================================
-def main():
-    global latest_frame, stream_overlay_data
-    
-    print("="*60)
-    print("WRO 2025 - Open Challenge - Simple Wall Following + Gyro 90° turns")
-    print("="*60)
-
-    # Init hardware
-    vl53 = setup_sensors()
-    pi, servo = setup_motor_servo()
-    mpu = setup_mpu6050()
-    pd = PDController(kp=PD_KP, kd=PD_KD)
-
-    # Camera
-    picam2, remap = init_camera()
-
-    # Start Flask streaming server
-    if ENABLE_STREAM and picam2:
-        print(f"\n🌐 Starting Flask stream server on port {FLASK_PORT}...")
-        flask_thread = threading.Thread(target=start_flask_server, daemon=True)
-        flask_thread.start()
-        print(f"✓ Stream available at: http://<your-pi-ip>:{FLASK_PORT}")
-        time.sleep(1)
-
-    # Calibrate gyro bias if possible
-    gyro_bias = calibrate_gyro(mpu) if mpu else 0.0
-
-    # Wait for Start button (SWITCH_PIN). According to WRO, robot must wait after power on.
-    print("\nWaiting for Start button (press to RUN)...")
-    while GPIO.input(SWITCH_PIN) == 1:
-        time.sleep(0.05)
-
-    GPIO.output(LED_BLUE, GPIO.HIGH)
-    print("\n🚗 RUNNING!\n")
-    print("Right | Left | Front | Steering | Action")
-    print("-" * 55)
-
-    try:
         while True:
-            # If switch released, pause motors
-            if GPIO.input(SWITCH_PIN) == 1:
-                stop_motor(pi)
-                servo.angle = 0
-                GPIO.output(LED_BLUE, GPIO.LOW)
-                stream_overlay_data = {"action": "PAUSED"}
-                time.sleep(0.05)
-                continue
-            GPIO.output(LED_BLUE, GPIO.HIGH)
-
-            # Read TOF sensors
-            distances = read_sensors(vl53)
-
-            # Capture camera frame and compute error (pixel space)
-            frame = camera_capture_frame(picam2, remap)
-            cam_error, annotated_frame = detect_walls_from_camera(frame, visualize=True)
-            
-            # Update stream frame
-            if ENABLE_STREAM and annotated_frame is not None:
-                with frame_lock:
-                    latest_frame = annotated_frame
-
-            # Safety: emergency front stop
-            if distances['Front'] < 80:
-                print("‼️ FRONT TOO CLOSE - stopping")
-                stop_motor(pi)
-                servo.angle = 0
-                stream_overlay_data = {"action": "EMERGENCY STOP", "front": distances['Front']}
-                time.sleep(0.2)
-                continue
-
-            # Corner detection via TOF (reliable short-range)
-            corner = detect_corner(distances)
-            if corner and mpu:
-                stop_motor(pi)
-                stream_overlay_data = {"action": f"TURNING {corner.upper()}"}
-                time.sleep(0.12)
-                success = turn_90(pi, servo, mpu, gyro_bias, corner)
-                pd.last_error = 0.0
-                pd.last_time = None
-                if not success:
-                    print("⚠️ Turn failed - brief pause")
-                    time.sleep(0.5)
-                continue
-
-            # Steering: prefer camera error; fallback to TOF diff
-            if cam_error is not None:
-                control_out = pd.update(cam_error)
-            else:
-                diff = distances['Right'] - distances['Left']
-                if abs(diff) < DEAD_ZONE:
-                    control_out = 0.0
-                else:
-                    control_out = pd.update(diff)
-
-            # Map control_out to servo angle directly (tune PD gains to produce reasonable range)
-            angle = max(-MAX_STEER, min(MAX_STEER, control_out))
-            apply_steering(servo, angle)
-            run_motor(pi, SPEED)
-
-            # Status print
-            if abs(angle) < 5:
-                action = "STRAIGHT"
-            elif angle > 0:
-                action = f"RIGHT {abs(angle):.0f}°"
-            else:
-                action = f"LEFT {abs(angle):.0f}°"
-
-            print(f"{distances['Right']:4} | {distances['Left']:4} | {distances['Front']:4} | "
-                  f"{angle:6.1f}° | {action}")
-            
-            if cam_error is not None:
-                print(f"  📷 Camera working: {cam_error:.1f}px error")
-            
-            # Update stream overlay data
-            stream_overlay_data = {
-                "front": distances['Front'],
-                "left": distances['Left'],
-                "right": distances['Right'],
-                "back": distances['Back'],
-                "steering": f"{angle:.1f}°",
-                "action": action,
-                "cam_error": f"{cam_error:.1f}px" if cam_error is not None else "TOF Mode"
-            }
-            
-            time.sleep(0.05)
-
-    except KeyboardInterrupt:
-        print("\n\nStopped by user")
-
-    finally:
-        stop_motor(pi)
-        servo.angle = 0
-        GPIO.output(LED_BLUE, GPIO.LOW)
-        pi.stop()
-        GPIO.cleanup()
+            try:
+                # Read current switch state directly
+                # GPIO.input returns 1 when switch is ON, 0 when OFF
+                current_state = GPIO.input(SWITCH_PIN)
+                
+                # Only act on state changes
+                if current_state != last_state:
+                    time.sleep(0.3)  # Debounce delay
+                    
+                    # Verify state is still the same after debounce
+                    if GPIO.input(SWITCH_PIN) == current_state:
+                        last_state = current_state
+                        
+                        if current_state == 1:  # Switch ON (HIGH)
+                            if not self.mission_started:
+                                print("\n🔛 SWITCH ON - Starting mission...")
+                                self.start_mission()
+                                self.mission_started = True
+                        else:  # Switch OFF (LOW)
+                            if self.mission_started:
+                                print("\n🔴 SWITCH OFF - Stopping mission...")
+                                self.stop_mission()
+                                self.mission_started = False
+                
+                time.sleep(0.2)  # Check every 200ms
+                
+            except Exception as e:
+                print(f"⚠ Switch monitor error: {e}")
+                time.sleep(1)
+    
+    def button_pressed(self):
+        """Not used with direct GPIO reading"""
+        pass
+    
+    def start_mission(self):
+        """Start autonomous mission"""
+        if self.is_running:
+            print("⚠ Mission already running!")
+            return
+        
+        print("\n" + "🚀"*30)
+        print("STARTING AUTONOMOUS MISSION")
+        print("🚀"*30)
+        
+        # Reset controllers
+        self.vision_controller.reset()
+        self.gyro_controller.cumulative_rotation = 0.0
+        self.gyro_controller.current_heading = 0.0
+        
+        # Activate vision steering
+        self.vision_controller.start()
+        
+        # Start motor and steering loop
+        self.gyro_controller.start_continuous_steering(DEFAULT_MOTOR_SPEED)
+        
+        self.steering_thread = threading.Thread(
+            target=self.gyro_controller.steering_loop,
+            args=(self.vision_controller, self.roi_zones),
+            daemon=True
+        )
+        self.steering_thread.start()
+        
+        self.is_running = True
+        print("✓ Mission started! Robot is now autonomous.")
+        print("  Toggle switch OFF for emergency stop.\n")
+    
+    def stop_mission(self):
+        """Emergency stop"""
+        if not self.is_running:
+            return
+        
+        print("\n🛑 EMERGENCY STOP!")
+        self.vision_controller.stop()
+        self.gyro_controller.stop_continuous_steering()
+        self.is_running = False
+        print("✓ Mission stopped\n")
+    
+    def run(self):
+        """Main run loop - just wait for button presses"""
         try:
-            picam2.stop()
-        except Exception:
-            pass
-        print("Done!")
+            print("Waiting for button press...")
+            pause()  # Wait indefinitely for button events
+        except KeyboardInterrupt:
+            print("\n\n⚠ Keyboard interrupt detected")
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Cleanup before exit"""
+        print("\n🔧 Shutting down...")
+        self.stop_mission()
+        self.gyro_controller.cleanup()
+        picam2.stop()
+        GPIO.cleanup()
+        print("✓ Cleanup complete. Goodbye!")
 
+# -----------------------------
+# Entry Point
+# -----------------------------
 if __name__ == "__main__":
-    main()
+    try:
+        robot = AutonomousRobot()
+        robot.run()
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
