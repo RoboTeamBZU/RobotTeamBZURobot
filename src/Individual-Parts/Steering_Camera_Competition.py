@@ -358,27 +358,64 @@ class AutonomousRobot:
         self.roi_zones = load_roi_config()
         self.steering_thread = None
         self.is_running = False
+        self.mission_started = False  # Track if we've started this switch cycle
         
-        # Setup button
-        self.button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.1)
-        self.button.when_pressed = self.button_pressed
+        # Setup switch monitoring (using polling instead of events)
+        self.button = Button(BUTTON_PIN, pull_up=True, bounce_time=0.5)
+        
+        # Start switch monitor thread
+        self.monitor_thread = threading.Thread(target=self.monitor_switch, daemon=True)
+        self.monitor_thread.start()
         
         print("\n" + "="*60)
         print("🤖 AUTONOMOUS WALL-FOLLOWING ROBOT")
         print("="*60)
-        print(f"Button: GPIO {BUTTON_PIN}")
+        print(f"Switch: GPIO {BUTTON_PIN} (Toggle switch mode)")
         print(f"Servo: GPIO {SERVO_PIN} (Range: {SERVO_MAX_LEFT}° to {SERVO_MAX_RIGHT}°)")
         print(f"Motor: IN1={IN1}, IN2={IN2}, ENA={ENA} (Speed: {DEFAULT_MOTOR_SPEED})")
         print(f"Mission: Complete 3 laps ({LAP_LIMIT}° rotation)")
-        print("\n✅ Ready! Press button on GPIO 25 to start...")
+        print("\n✅ Ready! Toggle switch ON to start mission")
+        print("   Toggle switch OFF to stop mission")
         print("="*60 + "\n")
         
+    def monitor_switch(self):
+        """Continuously monitor switch state (better for toggle switches)"""
+        print("✓ Switch monitor thread started")
+        last_state = None
+        
+        while True:
+            try:
+                # Read current switch state (False = pressed/closed, True = open)
+                current_state = self.button.is_pressed
+                
+                # Only act on state changes
+                if current_state != last_state:
+                    time.sleep(0.2)  # Debounce delay
+                    
+                    # Verify state is still the same
+                    if self.button.is_pressed == current_state:
+                        last_state = current_state
+                        
+                        if current_state:  # Switch closed/pressed
+                            if not self.mission_started:
+                                print("\n🔛 Switch ON detected")
+                                self.start_mission()
+                                self.mission_started = True
+                        else:  # Switch open/released
+                            if self.mission_started:
+                                print("\n🔴 Switch OFF detected")
+                                self.stop_mission()
+                                self.mission_started = False
+                
+                time.sleep(0.1)  # Check every 100ms
+                
+            except Exception as e:
+                print(f"⚠ Switch monitor error: {e}")
+                time.sleep(1)
+    
     def button_pressed(self):
-        """Handle button press - start or stop"""
-        if not self.is_running:
-            self.start_mission()
-        else:
-            self.stop_mission()
+        """Legacy method - not used with switch monitoring"""
+        pass
     
     def start_mission(self):
         """Start autonomous mission"""
@@ -410,7 +447,7 @@ class AutonomousRobot:
         
         self.is_running = True
         print("✓ Mission started! Robot is now autonomous.")
-        print("  Press button again to emergency stop.\n")
+        print("  Toggle switch OFF for emergency stop.\n")
     
     def stop_mission(self):
         """Emergency stop"""
